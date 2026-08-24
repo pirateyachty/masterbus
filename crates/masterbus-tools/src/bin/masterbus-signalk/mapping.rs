@@ -178,7 +178,7 @@ pub(super) fn map_field(
 ) -> Option<(String, serde_json::Value)> {
     let unit = unit.trim();
 
-    let mapped = match class {
+    match class {
         // ---------------------------------------------------------------------
         // BAT — Mastervolt lithium batteries / battery monitor.
         // ---------------------------------------------------------------------
@@ -823,9 +823,7 @@ pub(super) fn map_field(
         }
 
         _ => None,
-    };
-
-    mapped
+    }
 }
 
 /// Return the Signal K path a discovered field would use, without requiring a

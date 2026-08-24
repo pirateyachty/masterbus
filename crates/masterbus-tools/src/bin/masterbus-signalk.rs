@@ -246,7 +246,7 @@ fn merge_device_config(config: &mut FieldsConfig, d: &DeviceMetaRec) -> bool {
     true
 }
 
-fn configured_device<'a>(config: &'a FieldsConfig, device: DeviceId) -> Option<&'a DeviceConfig> {
+fn configured_device(config: &FieldsConfig, device: DeviceId) -> Option<&DeviceConfig> {
     let key = device_key(device);
     config.devices.iter().find(|e| e.device == key)
 }
@@ -776,6 +776,149 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
     }
 }
 
+/// Resolve the effective Signal K base path(s) for a device from enabled fields.
+///
+/// For each built-in suggested base, take the suffix of a field's suggested path
+/// and apply that same suffix to the user's configured path. This makes a user
+/// rename such as `fwd-charger` -> `fwdAC` carry through to static metadata too,
+/// without hard-coding vessel-specific names in Rust.
+fn effective_bases_for_device(d: &DeviceMetaRec, config: &FieldsConfig) -> HashSet<String> {
+    let device = device_key(d.device);
+    let mut bases = HashSet::new();
+
+    for f in config
+        .fields
+        .iter()
+        .filter(|f| f.device == device && f.enabled && !f.path.trim().is_empty())
+    {
+        for suggested_base in sk_bases(&d.class, &d.instance) {
+            let suffix = if f.suggested_path == suggested_base {
+                ""
+            } else if let Some(suffix) = f
+                .suggested_path
+                .strip_prefix(&(suggested_base.clone() + "."))
+            {
+                // Restore the dot so we can remove exactly the mapped leaf suffix
+                // from the custom publication path.
+                // `suffix_owned` lives only in this branch, so handle it inline.
+                let suffix = format!(".{suffix}");
+                if let Some(custom_base) = f.path.strip_suffix(&suffix) {
+                    if !custom_base.is_empty() {
+                        bases.insert(custom_base.to_string());
+                    }
+                }
+                continue;
+            } else {
+                continue;
+            };
+
+            if suffix.is_empty() {
+                bases.insert(f.path.clone());
+            }
+        }
+    }
+
+    bases
+}
+
+/// Build the one-shot Signal K static metadata batch.
+///
+/// Support for device name, manufacturer name and model remains in the generic
+/// sidecar, but every item is explicitly opt-in through `[[devices]]` in the
+/// TOML. Metadata is emitted at the effective user-configured base path(s).
+fn static_meta_batch(
+    devs: &[DeviceMetaRec],
+    published: &HashSet<DeviceId>,
+    config: &FieldsConfig,
+) -> Vec<u8> {
+    let mut batch = Vec::new();
+    for d in devs {
+        if !published.contains(&d.device) {
+            continue;
+        }
+        let Some(dc) = configured_device(config, d.device) else {
+            continue;
+        };
+        if !dc.publish_name && !dc.publish_manufacturer_name && !dc.publish_model {
+            continue;
+        }
+
+        let mut values = Vec::new();
+        for base in effective_bases_for_device(d, config) {
+            if dc.publish_name && !d.name.is_empty() {
+                values.push(json!({ "path": format!("{base}.name"), "value": d.name }));
+            }
+            if dc.publish_manufacturer_name {
+                values.push(json!({
+                    "path": format!("{base}.manufacturer.name"),
+                    "value": "Mastervolt"
+                }));
+            }
+            if dc.publish_model && !d.article.is_empty() {
+                values.push(json!({
+                    "path": format!("{base}.manufacturer.model"),
+                    "value": d.article
+                }));
+            }
+        }
+        if values.is_empty() {
+            continue;
+        }
+        let delta = json!({
+            "updates": [{ "$source": "masterbus", "timestamp": now_rfc3339(), "values": values }]
+        });
+        batch.extend_from_slice(serde_json::to_string(&delta).unwrap().as_bytes());
+        batch.push(b'\n');
+    }
+    batch
+}
+
+/// Lowercase and keep only Signal K path-segment-safe characters in an instance
+/// id (lowercase reads more idiomatically in Signal K paths).
+fn sanitize(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "0".into()
+    } else {
+        cleaned
+    }
+}
+
+/// Current UTC time as an ISO-8601 / RFC-3339 string (no date dependency).
+fn now_rfc3339() -> String {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs();
+    let millis = d.subsec_millis();
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let (y, mo, day) = civil_from_days((secs / 86400) as i64);
+    format!("{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
+}
+
+/// Days since 1970-01-01 → (year, month, day). Howard Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { y + 1 } else { y }, month, day)
+}
+
 #[cfg(test)]
 mod field_config_tests {
     use super::*;
@@ -960,147 +1103,4 @@ mod field_config_tests {
         assert!(!batch.contains("manufacturer.name"));
         assert!(!batch.contains("electrical.chargers.fwd-charger"));
     }
-}
-
-/// Resolve the effective Signal K base path(s) for a device from enabled fields.
-///
-/// For each built-in suggested base, take the suffix of a field's suggested path
-/// and apply that same suffix to the user's configured path. This makes a user
-/// rename such as `fwd-charger` -> `fwdAC` carry through to static metadata too,
-/// without hard-coding vessel-specific names in Rust.
-fn effective_bases_for_device(d: &DeviceMetaRec, config: &FieldsConfig) -> HashSet<String> {
-    let device = device_key(d.device);
-    let mut bases = HashSet::new();
-
-    for f in config
-        .fields
-        .iter()
-        .filter(|f| f.device == device && f.enabled && !f.path.trim().is_empty())
-    {
-        for suggested_base in sk_bases(&d.class, &d.instance) {
-            let suffix = if f.suggested_path == suggested_base {
-                ""
-            } else if let Some(suffix) = f
-                .suggested_path
-                .strip_prefix(&(suggested_base.clone() + "."))
-            {
-                // Restore the dot so we can remove exactly the mapped leaf suffix
-                // from the custom publication path.
-                // `suffix_owned` lives only in this branch, so handle it inline.
-                let suffix = format!(".{suffix}");
-                if let Some(custom_base) = f.path.strip_suffix(&suffix) {
-                    if !custom_base.is_empty() {
-                        bases.insert(custom_base.to_string());
-                    }
-                }
-                continue;
-            } else {
-                continue;
-            };
-
-            if suffix.is_empty() {
-                bases.insert(f.path.clone());
-            }
-        }
-    }
-
-    bases
-}
-
-/// Build the one-shot Signal K static metadata batch.
-///
-/// Support for device name, manufacturer name and model remains in the generic
-/// sidecar, but every item is explicitly opt-in through `[[devices]]` in the
-/// TOML. Metadata is emitted at the effective user-configured base path(s).
-fn static_meta_batch(
-    devs: &[DeviceMetaRec],
-    published: &HashSet<DeviceId>,
-    config: &FieldsConfig,
-) -> Vec<u8> {
-    let mut batch = Vec::new();
-    for d in devs {
-        if !published.contains(&d.device) {
-            continue;
-        }
-        let Some(dc) = configured_device(config, d.device) else {
-            continue;
-        };
-        if !dc.publish_name && !dc.publish_manufacturer_name && !dc.publish_model {
-            continue;
-        }
-
-        let mut values = Vec::new();
-        for base in effective_bases_for_device(d, config) {
-            if dc.publish_name && !d.name.is_empty() {
-                values.push(json!({ "path": format!("{base}.name"), "value": d.name }));
-            }
-            if dc.publish_manufacturer_name {
-                values.push(json!({
-                    "path": format!("{base}.manufacturer.name"),
-                    "value": "Mastervolt"
-                }));
-            }
-            if dc.publish_model && !d.article.is_empty() {
-                values.push(json!({
-                    "path": format!("{base}.manufacturer.model"),
-                    "value": d.article
-                }));
-            }
-        }
-        if values.is_empty() {
-            continue;
-        }
-        let delta = json!({
-            "updates": [{ "$source": "masterbus", "timestamp": now_rfc3339(), "values": values }]
-        });
-        batch.extend_from_slice(serde_json::to_string(&delta).unwrap().as_bytes());
-        batch.push(b'\n');
-    }
-    batch
-}
-
-/// Lowercase and keep only Signal K path-segment-safe characters in an instance
-/// id (lowercase reads more idiomatically in Signal K paths).
-fn sanitize(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "0".into()
-    } else {
-        cleaned
-    }
-}
-
-/// Current UTC time as an ISO-8601 / RFC-3339 string (no date dependency).
-fn now_rfc3339() -> String {
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs();
-    let millis = d.subsec_millis();
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    let (y, mo, day) = civil_from_days((secs / 86400) as i64);
-    format!("{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
-}
-
-/// Days since 1970-01-01 → (year, month, day). Howard Hinnant's algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if month <= 2 { y + 1 } else { y }, month, day)
 }
