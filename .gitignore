@@ -2,3 +2,6 @@
 **/*.rs.bk
 .DS_Store
 Makefile.local
+
+# Signal K per-installation field publication configuration
+masterbus-signalk-fields.toml

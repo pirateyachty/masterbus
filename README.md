@@ -129,16 +129,76 @@ field (booleans toggle, numbers / lists / text open a centred edit modal),
 
 ### Signal K sidecar
 
-`masterbus-signalk` is a long-running service that publishes MasterBus monitoring
-values as **Signal K deltas** (newline-delimited JSON) over TCP (default
-`0.0.0.0:3009`), with SI-unit conversion. A `mapping.ini` controls which
-devices/menus/groups are published; new devices are auto-added with sane defaults.
-Ships with a hardened systemd unit.
+`masterbus-signalk` is a long-running service that discovers MasterBus devices and
+their monitoring fields, converts supported values to SI units, and publishes
+**Signal K deltas** (newline-delimited JSON) over TCP (default `0.0.0.0:3009`).
+
+Discovery and publication are deliberately separate: a discovered field is **not**
+published until the user explicitly enables it in
+`masterbus-signalk-fields.toml`.
 
 ```sh
 masterbus-signalk [listen-addr]
 # e.g. masterbus-signalk 0.0.0.0:3009
 ```
+
+On discovery the sidecar creates or updates `masterbus-signalk-fields.toml` in
+its working directory. Each field entry records the MasterBus device address,
+class, discovered instance/group/name/unit, the mapper's `suggested_path`, the
+effective user-editable `path`, and an `enabled` flag. New fields default to:
+
+```toml
+enabled = false
+```
+
+Users may enable individual fields and override their Signal K paths without
+changing the Rust mapper:
+
+```toml
+[[fields]]
+device = "0x123456"
+class = "CHG"
+instance = "fwd-charger"
+group = "monitoring"
+index = "2"
+field = "Output 1"
+unit = "V"
+enabled = true
+suggested_path = "electrical.chargers.fwd-charger.voltage"
+path = "electrical.chargers.fwdAC.voltage"
+```
+
+Existing user choices are preserved across rediscovery because entries are keyed
+by stable MasterBus device address + field index. Newly discovered devices and
+fields are appended disabled. Fields not yet recognized by the built-in mapper
+are still listed, allowing a user to provide a custom path explicitly.
+
+Static device metadata is independently opt-in per device:
+
+```toml
+[[devices]]
+device = "0x123456"
+class = "CHG"
+instance = "fwd-charger"
+publish_name = true
+publish_manufacturer_name = false
+publish_model = true
+```
+
+When field paths are customized, enabled static metadata follows the effective
+user-selected Signal K base path as well, so installation-specific names do not
+need to be hard-coded in the mapper.
+
+The sidecar continues to watch for devices that were absent during initial
+startup discovery. A newly appearing device is added to the configuration at
+runtime. A previously known device that temporarily disappears does not lose its
+configuration; when it resumes sending values, its enabled fields can resume
+normally.
+
+`masterbus-signalk-fields.toml` is installation-specific runtime configuration
+and is intentionally excluded from Git.
+
+Ships with a hardened systemd unit.
 
 ### C library and demos
 

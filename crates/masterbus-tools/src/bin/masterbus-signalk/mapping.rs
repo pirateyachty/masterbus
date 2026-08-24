@@ -5,7 +5,7 @@
 //! known Mastervolt classes to sensible Signal K paths. Device-specific/user
 //! overrides can be layered on top later without changing the transport code.
 
-use masterbus::Value;
+use masterbus::{Time, Value};
 
 /// SI unit for a published Signal K path, keyed on its leaf segment.
 ///
@@ -849,6 +849,16 @@ pub(super) fn suggested_path(
             index: 0,
             options: vec!["probe".into()],
         },
+        // Time-valued monitoring fields (for example battery "Time remaining")
+        // cannot be classified with a Float probe because their mapping uses
+        // seconds_value(). Include a valid duration so mapping knowledge is
+        // independent of the current live value.
+        Value::Time(Time {
+            sec: 0,
+            min: 0,
+            hour: 0,
+            days: 0,
+        }),
     ];
 
     probes
@@ -879,6 +889,26 @@ mod tests {
         assert_eq!(
             suggested_path("MCU", "combi", "ac-inputs", "Mains", "V").as_deref(),
             Some("electrical.inverters.combi.acInputs.mains.voltage")
+        );
+    }
+
+    #[test]
+    fn suggested_path_recognizes_battery_time_remaining() {
+        assert_eq!(
+            suggested_path("BAT", "li-ion-1", "battery", "Time remaining", "").as_deref(),
+            Some("electrical.batteries.li-ion-1.capacity.timeRemaining")
+        );
+        assert_eq!(
+            suggested_path("BAT", "li-ion-1", "cluster", "Time remaining", "").as_deref(),
+            Some("electrical.masterbus.li-ion-1.cluster.timeRemaining")
+        );
+    }
+
+    #[test]
+    fn suggested_path_recognizes_mastershunt_remaining() {
+        assert_eq!(
+            suggested_path("MSH", "solar", "general", "Remaining", "").as_deref(),
+            Some("electrical.batteries.solar.capacity.timeRemaining")
         );
     }
 

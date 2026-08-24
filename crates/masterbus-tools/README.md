@@ -58,15 +58,18 @@ quits.
 
 ## `masterbus-signalk`
 
-[Signal K](https://signalk.org) sidecar: subscribes to the monitoring
-values of every device and serves Signal K deltas as newline-delimited
-JSON over TCP (default `0.0.0.0:3009`), with values converted to SI
-units. The instance id is the device's name, lowercased and stripped of
-its leading class word (e.g. `BAT Main Batt 4` → `main-batt-4`).
+[Signal K](https://signalk.org) sidecar: discovers MasterBus devices and their
+monitoring fields, converts supported values to SI units, and serves Signal K
+deltas as newline-delimited JSON over TCP (default `0.0.0.0:3009`).
 
     masterbus-signalk [listen-addr]
     # e.g.: masterbus-signalk                # default port (0.0.0.0:3009)
     #       masterbus-signalk 0.0.0.0:4000   # bind elsewhere
+
+The built-in mapper supplies sensible Signal K paths for supported MasterBus
+device classes and fields. Discovery is intentionally separate from
+publication: **nothing is published merely because it was discovered**.
+Publication is controlled per field by `masterbus-signalk-fields.toml`.
 
 Sample delta:
 
@@ -74,28 +77,97 @@ Sample delta:
 {"updates":[{"$source":"masterbus","timestamp":"2026-05-25T18:00:00.000Z","values":[{"path":"electrical.batteries.main-batt-4.voltage","value":26.6}]}]}
 ```
 
-### Filtering with `mapping.ini`
+### Field publication configuration
 
-If the `MAPPING` environment variable points at a file, output is gated
-per device/group. As devices are discovered the file is auto-populated
-and rewritten; **edit the `true`/`false` flags while the service is
-stopped**, then restart.
+On discovery, `masterbus-signalk` creates or updates
+`masterbus-signalk-fields.toml` in the current working directory. The file is
+installation-specific and is intentionally excluded from Git.
 
-Keys are `<instance>.<menu>[.<group>] = true|false`. A group-level line
-overrides the menu-level line. New entries default **off**, except a
-battery's `cluster` group, which defaults **on** — so out of the box
-you get the battery cluster and nothing else:
+Every newly discovered field defaults to:
 
-```ini
-# main-batt — groups: battery, cluster
-main-batt.monitoring = false
-main-batt.monitoring.cluster = true
-
-# combimaster — groups: ac-in, ac-out, dc-in-out, general
-combimaster.monitoring = false
+```toml
+enabled = false
 ```
 
-Without `MAPPING`, every mapped field is published.
+so a user must explicitly choose what is sent to Signal K.
+
+A field entry looks like:
+
+```toml
+[[fields]]
+device = "0x123456"
+class = "CHG"
+instance = "fwd-charger"
+group = "monitoring"
+index = "2"
+field = "Output 1"
+unit = "V"
+enabled = false
+suggested_path = "electrical.chargers.fwd-charger.voltage"
+path = "electrical.chargers.fwd-charger.voltage"
+```
+
+`device` is the stable MasterBus device address and `index` identifies the
+field on that device. Those values are used to preserve the user's choices
+across rediscovery even if a device name changes.
+
+`suggested_path` is maintained by the built-in mapper. `path` is the effective
+Signal K path and may be edited freely. To publish the field, set
+`enabled = true`.
+
+For example:
+
+```toml
+enabled = true
+suggested_path = "electrical.chargers.fwd-charger.voltage"
+path = "electrical.chargers.fwdAC.voltage"
+```
+
+publishes that value as `electrical.chargers.fwdAC.voltage`.
+
+User path choices are not overwritten when discovery runs again. Newly
+discovered fields are added disabled. Fields that the built-in mapper does not
+yet recognize are also recorded in the configuration with an empty suggested
+path; a user can assign a custom `path` and explicitly enable them without
+changing the Rust mapper.
+
+### Static device metadata
+
+Static Signal K metadata is independently opt-in per device:
+
+```toml
+[[devices]]
+device = "0x123456"
+class = "CHG"
+instance = "fwd-charger"
+publish_name = true
+publish_manufacturer_name = false
+publish_model = true
+```
+
+`name`, `manufacturer.name`, and `manufacturer.model` can therefore be enabled
+or disabled independently.
+
+Metadata follows the effective user-configured Signal K base path derived from
+enabled fields. For example, if a user changes a field from the suggested
+`electrical.chargers.fwd-charger...` path to
+`electrical.chargers.fwdAC...`, enabled static metadata for that device is
+published under `electrical.chargers.fwdAC...` as well. Vessel- or
+installation-specific names therefore do not need to be hard-coded into the
+mapper.
+
+### Discovery and rediscovery
+
+At startup the sidecar performs an initial MasterBus discovery, builds the
+field inventory, and updates the TOML configuration.
+
+It then continues discovery while running so a device that was not powered or
+present during startup can be added later. New devices and fields are added to
+the configuration with publication disabled by default.
+
+A previously discovered device does not need to be rediscovered simply because
+it temporarily stops sending data. While it is absent there are no new values
+to publish; when it resumes sending, its configured fields can resume normally.
 
 ### Run as a systemd service
 
@@ -110,11 +182,11 @@ sudo cp etc/masterbus-signalk.service /etc/systemd/system/
 sudo systemctl enable --now masterbus-signalk
 ```
 
-Transport, master role, and the schema-cache directory are configured
-in `/etc/default/masterbus/config.ini` (auto-created on first run; see
-the **Configuration** section above) and the systemd unit's `LISTEN`
-env var. The service keeps a persistent schema cache in
-`/var/lib/masterbus` and restarts on failure.
+Transport, master role, and the schema-cache directory are configured in
+`/etc/default/masterbus/config.ini` (auto-created on first run; see the
+**Configuration** section above) and the systemd unit's `LISTEN` env var. The
+service keeps a persistent schema cache in `/var/lib/masterbus` and restarts on
+failure.
 
 ## `masterbus-set-field`
 

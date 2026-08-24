@@ -34,14 +34,15 @@
 //! `manufacturer` (name + article/model) metadata once per client connection —
 //! see [`static_meta_batch`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use masterbus::{Config, DeviceId, FieldId, MasterBus, Menu};
+use masterbus::{Config, DeviceEvent, DeviceId, FieldId, MasterBus, Menu};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[path = "masterbus-signalk/mapping.rs"]
@@ -52,18 +53,20 @@ use mapping::{map_field, sk_bases, sk_units, suggested_path};
 /// Default TCP listen address.
 const DEFAULT_LISTEN: &str = "0.0.0.0:3009";
 
-/// The menu the sidecar publishes (only monitoring carries mapped data today).
-const MENU: &str = "monitoring";
-
 /// How often each value is (re)emitted.
 const RATE: Duration = Duration::from_millis(1000);
+
+/// Default field-level publication configuration.
+const DEFAULT_FIELDS_CONFIG: &str = "masterbus-signalk-fields.toml";
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let listen = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_LISTEN.to_string());
-    let mapping = std::env::var_os("MAPPING").map(PathBuf::from);
+    let fields_config = std::env::var_os("FIELDS_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_FIELDS_CONFIG));
 
     let bus = match MasterBus::auto(Config::default()) {
         Ok(b) => b,
@@ -72,7 +75,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(e) = run(bus, &listen, mapping.as_deref()) {
+    if let Err(e) = run(bus, &listen, &fields_config) {
         eprintln!("masterbus-signalk: {e}");
         std::process::exit(1);
     }
@@ -108,77 +111,331 @@ struct FieldMeta {
     group: String,
     name: String,
     unit: String,
+    path: String,
 }
 
-/// Parse a mapping file (`<instance>.<menu>[.<group>] = true|false`, `#` comments).
-fn load_mapping(path: &Path) -> BTreeMap<String, bool> {
-    let mut map = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return map;
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let on = matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "on"
-            );
-            map.insert(k.trim().to_string(), on);
-        }
+/// Persistent field-level publication configuration.
+///
+/// `suggested_path` is refreshed from the built-in mapper on discovery. `path` is
+/// the user's editable publication path. New entries are always disabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct FieldsConfig {
+    #[serde(default)]
+    devices: Vec<DeviceConfig>,
+    #[serde(default)]
+    fields: Vec<FieldConfig>,
+}
+
+/// Per-device static metadata publication configuration.
+///
+/// These are deliberately separate from monitoring fields: support for name,
+/// manufacturer name and model remains generic, while each item is explicitly
+/// opt-in in the user's TOML. Metadata paths follow the effective user-edited
+/// field base(s) for the device rather than forcing discovery-derived names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceConfig {
+    /// Stable MasterBus 24-bit device address (hex).
+    device: String,
+    class: String,
+    instance: String,
+    #[serde(default)]
+    publish_name: bool,
+    #[serde(default)]
+    publish_manufacturer_name: bool,
+    #[serde(default)]
+    publish_model: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FieldConfig {
+    /// Stable MasterBus 24-bit device address (hex).
+    device: String,
+    class: String,
+    instance: String,
+    group: String,
+    index: String,
+    field: String,
+    unit: String,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    suggested_path: String,
+    #[serde(default)]
+    path: String,
+}
+
+fn device_key(device: DeviceId) -> String {
+    format!("0x{device:06X}")
+}
+
+fn field_index_key(index: FieldId) -> String {
+    index.to_string()
+}
+
+fn load_fields_config(path: &Path) -> std::io::Result<FieldsConfig> {
+    if !path.exists() {
+        return Ok(FieldsConfig::default());
     }
-    map
+    let text = std::fs::read_to_string(path)?;
+    toml::from_str(&text).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid field config {}: {e}", path.display()),
+        )
+    })
 }
 
-/// Rewrite the mapping file: a per-instance comment listing its groups, the
-/// menu-level toggle, then any group-level toggles present in `map`.
-fn save_mapping(
-    path: &Path,
-    map: &BTreeMap<String, bool>,
-    groups_by_instance: &BTreeMap<String, BTreeSet<String>>,
-) -> std::io::Result<()> {
-    let mut out = String::new();
-    out.push_str(
-        "# masterbus-signalk Signal K mapping.\n\
-         # Edit the true/false flags below while the service is STOPPED, then restart.\n\
-         # Keys: <instance>.<menu>[.<group>] = true|false  (a group line overrides the\n\
-         # menu line). New devices are added automatically: the menu-level toggle\n\
-         # defaults to false and the battery `cluster` group to true.\n\n",
+fn save_fields_config(path: &Path, config: &FieldsConfig) -> std::io::Result<()> {
+    let mut copy = config.clone();
+    copy.devices.sort_by(|a, b| a.device.cmp(&b.device));
+    copy.fields.sort_by(|a, b| {
+        let a_index = a.index.parse::<u32>().unwrap_or(u32::MAX);
+        let b_index = b.index.parse::<u32>().unwrap_or(u32::MAX);
+
+        a.device
+            .cmp(&b.device)
+            .then_with(|| a_index.cmp(&b_index))
+            .then_with(|| a.index.cmp(&b.index))
+            .then_with(|| a.instance.cmp(&b.instance))
+            .then_with(|| a.group.cmp(&b.group))
+    });
+
+    let mut out = String::from(
+        "# masterbus-signalk field publication configuration.\n\
+         # New fields are discovered automatically and default to enabled = false.\n\
+         # `suggested_path` is maintained by the built-in mapper.\n\
+         # Edit `path` to publish under a custom Signal K path.\n\
+         # Entries are keyed by MasterBus device address + field index, so device-name\n\
+         # changes do not discard enabled/path choices.\n\
+         # Existing enabled/path choices are preserved when discovery runs again.\n\n",
     );
-    for (instance, groups) in groups_by_instance {
-        let glist = groups.iter().cloned().collect::<Vec<_>>().join(", ");
-        out.push_str(&format!("# {instance} \u{2014} groups: {glist}\n"));
-        let mk = format!("{instance}.{MENU}");
-        out.push_str(&format!(
-            "{mk} = {}\n",
-            map.get(&mk).copied().unwrap_or(false)
-        ));
-        for g in groups {
-            let gk = format!("{instance}.{MENU}.{g}");
-            if let Some(&v) = map.get(&gk) {
-                out.push_str(&format!("{gk} = {v}\n"));
-            }
-        }
-        out.push('\n');
-    }
+    out.push_str(
+        &toml::to_string_pretty(&copy)
+            .map_err(|e| std::io::Error::other(format!("could not serialize field config: {e}")))?,
+    );
     std::fs::write(path, out)
 }
 
-/// Resolve whether a field's (instance, menu, group) is enabled: a group-level
-/// entry wins over a menu-level one; the default is on only for `cluster`.
-fn enabled(map: &BTreeMap<String, bool>, instance: &str, menu: &str, group: &str) -> bool {
-    if let Some(&v) = map.get(&format!("{instance}.{menu}.{group}")) {
-        return v;
+/// Merge a discovered device into the persistent static-metadata configuration.
+///
+/// New devices default to publishing no static metadata. The stable MasterBus
+/// address preserves the user's choices if the device is renamed later.
+fn merge_device_config(config: &mut FieldsConfig, d: &DeviceMetaRec) -> bool {
+    let device = device_key(d.device);
+    if let Some(existing) = config.devices.iter_mut().find(|e| e.device == device) {
+        let mut changed = false;
+        if existing.class != d.class {
+            existing.class = d.class.clone();
+            changed = true;
+        }
+        if existing.instance != d.instance {
+            existing.instance = d.instance.clone();
+            changed = true;
+        }
+        return changed;
     }
-    if let Some(&v) = map.get(&format!("{instance}.{menu}")) {
-        return v;
-    }
-    group == "cluster"
+
+    config.devices.push(DeviceConfig {
+        device,
+        class: d.class.clone(),
+        instance: d.instance.clone(),
+        publish_name: false,
+        publish_manufacturer_name: false,
+        publish_model: false,
+    });
+    true
 }
 
-fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Result<()> {
+fn configured_device<'a>(config: &'a FieldsConfig, device: DeviceId) -> Option<&'a DeviceConfig> {
+    let key = device_key(device);
+    config.devices.iter().find(|e| e.device == key)
+}
+
+/// Merge a discovered field into the persistent configuration.
+///
+/// If a mapper suggestion changes after a software upgrade and the user had left
+/// `path` equal to the old suggestion, follow the new suggestion automatically.
+/// A genuinely customized path is never overwritten.
+fn merge_field_config(config: &mut FieldsConfig, f: &FieldRec) -> bool {
+    let device = device_key(f.device);
+    let index = field_index_key(f.index);
+    let suggestion =
+        suggested_path(&f.class, &f.instance, &f.group, &f.name, &f.unit).unwrap_or_default();
+
+    if let Some(existing) = config
+        .fields
+        .iter_mut()
+        .find(|e| e.device == device && e.index == index)
+    {
+        let old_suggestion = existing.suggested_path.clone();
+        let path_was_default = existing.path.is_empty() || existing.path == old_suggestion;
+        let mut changed = false;
+
+        if existing.class != f.class {
+            existing.class = f.class.clone();
+            changed = true;
+        }
+        if existing.instance != f.instance {
+            existing.instance = f.instance.clone();
+            changed = true;
+        }
+        if existing.group != f.group {
+            existing.group = f.group.clone();
+            changed = true;
+        }
+        if existing.field != f.name {
+            existing.field = f.name.clone();
+            changed = true;
+        }
+        if existing.unit != f.unit {
+            existing.unit = f.unit.clone();
+            changed = true;
+        }
+        if existing.suggested_path != suggestion {
+            existing.suggested_path = suggestion.clone();
+            changed = true;
+        }
+        if path_was_default && existing.path != suggestion {
+            existing.path = suggestion;
+            changed = true;
+        }
+        return changed;
+    }
+
+    config.fields.push(FieldConfig {
+        device,
+        class: f.class.clone(),
+        instance: f.instance.clone(),
+        group: f.group.clone(),
+        index,
+        field: f.name.clone(),
+        unit: f.unit.clone(),
+        enabled: false,
+        suggested_path: suggestion.clone(),
+        path: suggestion,
+    });
+    true
+}
+
+fn configured_field<'a>(config: &'a FieldsConfig, f: &FieldRec) -> Option<&'a FieldConfig> {
+    let device = device_key(f.device);
+    let index = field_index_key(f.index);
+    config
+        .fields
+        .iter()
+        .find(|e| e.device == device && e.index == index)
+}
+
+/// Enumerate the Monitoring fields of a device into plain records.
+/// Build the base Signal K/config instance name from the MasterBus-discovered
+/// device label. This is intentionally generic: no device class or vessel-specific
+/// names are hard-coded here.
+fn discovered_instance(label: &str, full_name: &str, device: DeviceId) -> String {
+    if !label.is_empty() {
+        sanitize(label)
+    } else if !full_name.is_empty() {
+        sanitize(full_name)
+    } else {
+        device.to_string()
+    }
+}
+
+fn discover_device_fields(dev: &masterbus::Device) -> (DeviceMetaRec, Vec<FieldRec>) {
+    let name = dev.name().unwrap_or_default();
+    let class = name.split_whitespace().next().unwrap_or("").to_string();
+    let label = name
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let instance = discovered_instance(&label, &name, dev.id());
+
+    let device_meta = DeviceMetaRec {
+        device: dev.id(),
+        class: class.clone(),
+        instance: instance.clone(),
+        name,
+        article: dev.article_number().unwrap_or_default(),
+    };
+
+    let mut fields = Vec::new();
+    if let Ok(groups) = dev.tab(Menu::Monitoring) {
+        for group in groups {
+            let gname = sanitize(&group.name().unwrap_or_default());
+            for field in group.fields().unwrap_or_default() {
+                fields.push(FieldRec {
+                    device: dev.id(),
+                    index: field.index(),
+                    class: class.clone(),
+                    instance: instance.clone(),
+                    group: gname.clone(),
+                    name: field.name().unwrap_or_default(),
+                    unit: field.unit().unwrap_or_default(),
+                });
+            }
+        }
+    }
+    (device_meta, fields)
+}
+
+/// Ensure instance names are unique within each MasterBus class.
+///
+/// Discovery remains authoritative. We only alter an instance when two devices of
+/// the same class would otherwise publish under the exact same sanitized instance.
+/// In that case the stable 24-bit MasterBus device address is appended.
+fn disambiguate_instances(device_metas: &mut [DeviceMetaRec], fields: &mut [FieldRec]) {
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+
+    for d in device_metas.iter() {
+        *counts
+            .entry((d.class.clone(), d.instance.clone()))
+            .or_default() += 1;
+    }
+
+    for d in device_metas.iter_mut() {
+        let key = (d.class.clone(), d.instance.clone());
+        if counts.get(&key).copied().unwrap_or(0) <= 1 {
+            continue;
+        }
+
+        let old = d.instance.clone();
+        let new = format!("{old}-{:06x}", d.device);
+        d.instance = new.clone();
+
+        for f in fields.iter_mut().filter(|f| f.device == d.device) {
+            f.instance = new.clone();
+        }
+    }
+}
+
+fn report_field_inventory(fields: &[FieldRec]) {
+    let mut known_fields = 0usize;
+    let mut unmapped_fields = 0usize;
+    for f in fields {
+        match suggested_path(&f.class, &f.instance, &f.group, &f.name, &f.unit) {
+            Some(path) => {
+                known_fields += 1;
+                eprintln!(
+                    "KNOWN class={} instance={} group={} index={:?} field={:?} unit={:?} path={}",
+                    f.class, f.instance, f.group, f.index, f.name, f.unit, path
+                );
+            }
+            None => {
+                unmapped_fields += 1;
+                eprintln!(
+                    "UNMAPPED class={} instance={} group={} index={:?} field={:?} unit={:?}",
+                    f.class, f.instance, f.group, f.index, f.name, f.unit
+                );
+            }
+        }
+    }
+    eprintln!(
+        "masterbus-signalk: mapping inventory: {known_fields} known, {unmapped_fields} unmapped, {} total",
+        fields.len()
+    );
+}
+
+fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Result<()> {
     // TCP server: clients (e.g. a Signal K server) connect and receive the delta
     // stream. The listener thread appends new connections to the shared set.
     let listener = TcpListener::bind(listen)?;
@@ -211,6 +468,11 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
         });
     }
 
+    // Subscribe to device-presence events before the initial discovery snapshot.
+    // Alive events that occur during startup remain queued and are filtered against
+    // the initial known-device set once the streaming loop begins.
+    let device_events = bus.device_events();
+
     // Allow MasterBus discovery to populate before taking the device snapshot.
     // Devices may announce at different times, especially on slower hardware.
     let discovery_start = std::time::Instant::now();
@@ -232,139 +494,80 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Discover the monitoring menu of every device, recording each field with its
-    // (sanitized) group so the mapping file can gate it.
+    // Enumerate every device that was present during the initial discovery window.
     let devices = bus.devices_all();
+    let mut known_devices: HashSet<DeviceId> = devices.iter().map(|d| d.id()).collect();
     let mut fields: Vec<FieldRec> = Vec::new();
     let mut device_metas: Vec<DeviceMetaRec> = Vec::new();
-    let mut groups_by_instance: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for dev in &devices {
-        let name = dev.name().unwrap_or_default();
-        let class = name.split_whitespace().next().unwrap_or("").to_string();
-        // Instance id = the device name without its leading class word (already
-        // implied by the SK path category), lowercased/sanitized.
-        let label = name
-            .split_whitespace()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let instance = if !label.is_empty() {
-            sanitize(&label)
-        } else if !name.is_empty() {
-            sanitize(&name)
-        } else {
-            dev.id().to_string()
-        };
-
-        device_metas.push(DeviceMetaRec {
-            device: dev.id(),
-            class: class.clone(),
-            instance: instance.clone(),
-            name: name.clone(),
-            article: dev.article_number().unwrap_or_default(),
-        });
-
-        let Ok(groups) = dev.tab(Menu::Monitoring) else {
-            continue;
-        };
-        for group in groups {
-            let gname = sanitize(&group.name().unwrap_or_default());
-            groups_by_instance
-                .entry(instance.clone())
-                .or_default()
-                .insert(gname.clone());
-            for field in group.fields().unwrap_or_default() {
-                fields.push(FieldRec {
-                    device: dev.id(),
-                    index: field.index(),
-                    class: class.clone(),
-                    instance: instance.clone(),
-                    group: gname.clone(),
-                    name: field.name().unwrap_or_default(),
-                    unit: field.unit().unwrap_or_default(),
-                });
-            }
-        }
+        let (device_meta, mut device_fields) = discover_device_fields(dev);
+        device_metas.push(device_meta);
+        fields.append(&mut device_fields);
     }
 
-    // Classify every discovered field against the built-in mapper. Unknown
-    // classes and new fields on known classes are reported but are not assigned
-    // guessed Signal K paths. This inventory is independent of publication
-    // gating, so even fields that are currently disabled remain visible here.
-    let mut known_fields = 0usize;
-    let mut unmapped_fields = 0usize;
+    disambiguate_instances(&mut device_metas, &mut fields);
+    report_field_inventory(&fields);
+
+    // Merge discovery into the persistent field-level configuration. A malformed
+    // config is fatal rather than being silently replaced and losing user choices.
+    let mut field_config = load_fields_config(fields_config_path)?;
+    let mut config_changed = !fields_config_path.exists();
+    for d in &device_metas {
+        config_changed |= merge_device_config(&mut field_config, d);
+    }
     for f in &fields {
-        match suggested_path(&f.class, &f.instance, &f.group, &f.name, &f.unit) {
-            Some(path) => {
-                known_fields += 1;
-                eprintln!(
-                    "KNOWN class={} instance={} group={} index={:?} field={:?} unit={:?} path={}",
-                    f.class, f.instance, f.group, f.index, f.name, f.unit, path
-                );
-            }
-            None => {
-                unmapped_fields += 1;
-                eprintln!(
-                    "UNMAPPED class={} instance={} group={} index={:?} field={:?} unit={:?}",
-                    f.class, f.instance, f.group, f.index, f.name, f.unit
-                );
-            }
-        }
+        config_changed |= merge_field_config(&mut field_config, f);
     }
-    eprintln!(
-        "masterbus-signalk: mapping inventory: {known_fields} known, {unmapped_fields} unmapped, {} total",
-        fields.len()
-    );
-
-    // Load / auto-fill / rewrite the mapping file (if configured).
-    let mut mapping = mapping_path.map(load_mapping).unwrap_or_default();
-    if let Some(path) = mapping_path {
-        use std::collections::btree_map::Entry;
-        let mut added = false;
-        for (instance, groups) in &groups_by_instance {
-            // Menu-level toggle defaults off.
-            if let Entry::Vacant(e) = mapping.entry(format!("{instance}.{MENU}")) {
-                e.insert(false);
-                added = true;
-            }
-            // The battery cluster group defaults on.
-            if groups.contains("cluster") {
-                if let Entry::Vacant(e) = mapping.entry(format!("{instance}.{MENU}.cluster")) {
-                    e.insert(true);
-                    added = true;
-                }
-            }
-        }
-        if added || !path.exists() {
-            if let Err(e) = save_mapping(path, &mapping, &groups_by_instance) {
-                eprintln!("masterbus-signalk: could not write {}: {e}", path.display());
-            }
-        }
+    if config_changed {
+        save_fields_config(fields_config_path, &field_config)?;
+        eprintln!(
+            "masterbus-signalk: wrote field config {}",
+            fields_config_path.display()
+        );
     }
 
-    // Build the emit metadata + per-device subscription list for enabled fields.
-    let gated = mapping_path.is_some();
+    // Build subscriptions only for explicitly enabled fields. The mapper still
+    // performs value conversion; the configured path replaces its suggested path.
     let mut meta: HashMap<(DeviceId, FieldId), FieldMeta> = HashMap::new();
     let mut per_device: HashMap<DeviceId, Vec<FieldId>> = HashMap::new();
+    let mut units_by_path: HashMap<String, &'static str> = HashMap::new();
+
     for f in &fields {
-        let on = !gated || enabled(&mapping, &f.instance, MENU, &f.group);
-        if on {
-            meta.insert(
-                (f.device, f.index),
-                FieldMeta {
-                    class: f.class.clone(),
-                    instance: f.instance.clone(),
-                    group: f.group.clone(),
-                    name: f.name.clone(),
-                    unit: f.unit.clone(),
-                },
-            );
-            per_device.entry(f.device).or_default().push(f.index);
+        let Some(cfg) = configured_field(&field_config, f) else {
+            continue;
+        };
+        if !cfg.enabled || cfg.path.trim().is_empty() {
+            continue;
         }
+
+        let Some(suggested) = suggested_path(&f.class, &f.instance, &f.group, &f.name, &f.unit)
+        else {
+            eprintln!(
+                "masterbus-signalk: enabled field is UNMAPPED and cannot publish yet: class={} instance={} group={} index={:?} field={:?}",
+                f.class, f.instance, f.group, f.index, f.name
+            );
+            continue;
+        };
+
+        let units = sk_units(&suggested);
+        if let Some(u) = units {
+            units_by_path.insert(cfg.path.clone(), u);
+        }
+        meta.insert(
+            (f.device, f.index),
+            FieldMeta {
+                class: f.class.clone(),
+                instance: f.instance.clone(),
+                group: f.group.clone(),
+                name: f.name.clone(),
+                unit: f.unit.clone(),
+                path: cfg.path.clone(),
+            },
+        );
+        per_device.entry(f.device).or_default().push(f.index);
     }
-    // Devices with at least one published field carry SK nodes; those are the
-    // ones whose static name/manufacturer metadata is worth emitting.
-    let published: HashSet<DeviceId> = per_device.keys().copied().collect();
+
+    let mut published: HashSet<DeviceId> = per_device.keys().copied().collect();
     let mut subs = Vec::new();
     for (device, indices) in per_device {
         subs.push(bus.subscribe(device, indices, RATE, false));
@@ -372,7 +575,7 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
 
     // Render the static metadata batch and hand it to the accept thread (for
     // future clients) and to any client already connected during discovery.
-    let sb = static_meta_batch(&device_metas, &published);
+    let sb = static_meta_batch(&device_metas, &published, &field_config);
     *static_batch.lock().unwrap() = sb.clone();
     if !sb.is_empty() {
         let mut cs = clients.lock().unwrap();
@@ -380,17 +583,17 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
     }
 
     eprintln!(
-        "masterbus-signalk: streaming {} of {} fields from {} device(s){}",
+        "masterbus-signalk: streaming {} of {} fields from {} initially discovered device(s) (field-config gated)",
         meta.len(),
         fields.len(),
         devices.len(),
-        if gated { " (mapping-gated)" } else { "" },
     );
 
     // Paths whose unit `meta` has already been published. Meta is emitted inline
     // the first time a path is seen and also appended to `static_batch` so later
     // clients receive it on connect.
     let mut meta_sent: HashSet<String> = HashSet::new();
+
     loop {
         // Skip building deltas when nobody is listening (the channels are still
         // drained below so they don't grow unbounded).
@@ -408,14 +611,15 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
                     && let Some((path, value)) =
                         map_field(&m.class, &m.instance, &m.group, &m.name, &m.unit, &u.value)
                 {
-                    latest.insert(path, value);
+                    let _ = path; // conversion path; publication path is user-configurable.
+                    latest.insert(m.path.clone(), value);
                 }
             }
             if !latest.is_empty() {
                 // First sighting of a path → publish its unit metadata once.
                 for path in latest.keys() {
                     if !meta_sent.contains(path)
-                        && let Some(units) = sk_units(path)
+                        && let Some(units) = units_by_path.get(path).copied()
                     {
                         new_meta.push(json!({ "path": path, "value": { "units": units } }));
                         meta_sent.insert(path.clone());
@@ -457,31 +661,390 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
                 eprintln!("masterbus-signalk: {dropped} client(s) disconnected");
             }
         }
+
+        // Device presence is event-driven in the MasterBus runtime. Only an Alive
+        // event for an ID that was absent from the initial discovery causes schema
+        // enumeration here. Offline events deliberately do nothing: configuration
+        // and subscriptions persist, so an initially known device can simply resume
+        // producing updates when it broadcasts again.
+        while let Ok(event) = device_events.try_recv() {
+            let DeviceEvent::Alive(id) = event else {
+                continue;
+            };
+            if known_devices.contains(&id) {
+                continue;
+            }
+
+            known_devices.insert(id);
+            let dev = bus.device(id);
+            let (mut device_meta, mut device_fields) = discover_device_fields(&dev);
+
+            if device_metas
+                .iter()
+                .any(|d| d.class == device_meta.class && d.instance == device_meta.instance)
+            {
+                let new_instance = format!("{}-{:06x}", device_meta.instance, id);
+                device_meta.instance = new_instance.clone();
+                for f in &mut device_fields {
+                    f.instance = new_instance.clone();
+                }
+            }
+
+            eprintln!(
+                "masterbus-signalk: new device discovered during runtime: {:?} name={:?}",
+                id, device_meta.name
+            );
+            report_field_inventory(&device_fields);
+
+            let mut config_changed = merge_device_config(&mut field_config, &device_meta);
+            for f in &device_fields {
+                config_changed |= merge_field_config(&mut field_config, f);
+            }
+
+            if config_changed {
+                if let Err(e) = save_fields_config(fields_config_path, &field_config) {
+                    eprintln!(
+                        "masterbus-signalk: could not update field config {}: {e}",
+                        fields_config_path.display()
+                    );
+                } else {
+                    eprintln!(
+                        "masterbus-signalk: updated field config {} with newly discovered device fields",
+                        fields_config_path.display()
+                    );
+                }
+            }
+
+            // Brand-new entries are disabled. If this device had appeared on an
+            // earlier run, however, matching persisted entries may already be enabled;
+            // subscribe to those immediately.
+            let mut indices = Vec::new();
+            for f in &device_fields {
+                let Some(cfg) = configured_field(&field_config, f) else {
+                    continue;
+                };
+                if !cfg.enabled || cfg.path.trim().is_empty() {
+                    continue;
+                }
+
+                let Some(suggested) =
+                    suggested_path(&f.class, &f.instance, &f.group, &f.name, &f.unit)
+                else {
+                    eprintln!(
+                        "masterbus-signalk: enabled field is UNMAPPED and cannot publish yet: class={} instance={} group={} index={:?} field={:?}",
+                        f.class, f.instance, f.group, f.index, f.name
+                    );
+                    continue;
+                };
+
+                if let Some(u) = sk_units(&suggested) {
+                    units_by_path.insert(cfg.path.clone(), u);
+                }
+                meta.insert(
+                    (f.device, f.index),
+                    FieldMeta {
+                        class: f.class.clone(),
+                        instance: f.instance.clone(),
+                        group: f.group.clone(),
+                        name: f.name.clone(),
+                        unit: f.unit.clone(),
+                        path: cfg.path.clone(),
+                    },
+                );
+                indices.push(f.index);
+            }
+
+            if !indices.is_empty() {
+                subs.push(bus.subscribe(id, indices, RATE, false));
+                published.insert(id);
+            }
+
+            device_metas.push(device_meta);
+            fields.extend(device_fields);
+
+            // Refresh the persistent static metadata snapshot. Only devices with
+            // at least one enabled/published field are included.
+            let sb = static_meta_batch(&device_metas, &published, &field_config);
+            *static_batch.lock().unwrap() = sb.clone();
+            if !sb.is_empty() {
+                let mut cs = clients.lock().unwrap();
+                cs.retain_mut(|c| c.write_all(&sb).and_then(|()| c.flush()).is_ok());
+            }
+        }
+
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Build the one-shot Signal K metadata batch: for every published device with a
-/// mapped category, its `name` and `manufacturer` (name + model). Values are
-/// static, so this is emitted once per client rather than on the poll loop.
-fn static_meta_batch(devs: &[DeviceMetaRec], published: &HashSet<DeviceId>) -> Vec<u8> {
+#[cfg(test)]
+mod field_config_tests {
+    use super::*;
+
+    fn sample_field(instance: &str) -> FieldRec {
+        FieldRec {
+            device: 0x123456,
+            index: 7,
+            class: "CMR".into(),
+            instance: instance.into(),
+            group: "monitoring".into(),
+            name: "Battery voltage".into(),
+            unit: "V".into(),
+        }
+    }
+
+    #[test]
+    fn discovered_instance_uses_device_label_generically() {
+        assert_eq!(discovered_instance("COMBI", "MCU COMBI", 0x186442), "combi");
+        assert_eq!(
+            discovered_instance("COMBI 2", "MCU COMBI 2", 0x19B442),
+            "combi-2"
+        );
+        assert_eq!(
+            discovered_instance("House Inverter", "MCU House Inverter", 0x123456),
+            "house-inverter"
+        );
+    }
+
+    #[test]
+    fn duplicate_instances_get_stable_device_id_suffixes() {
+        let mut metas = vec![
+            DeviceMetaRec {
+                device: 0x111111,
+                class: "MCU".into(),
+                instance: "combi".into(),
+                name: "MCU COMBI".into(),
+                article: String::new(),
+            },
+            DeviceMetaRec {
+                device: 0x222222,
+                class: "MCU".into(),
+                instance: "combi".into(),
+                name: "MCU COMBI".into(),
+                article: String::new(),
+            },
+        ];
+        let mut fields = vec![
+            FieldRec {
+                device: 0x111111,
+                index: 1,
+                class: "MCU".into(),
+                instance: "combi".into(),
+                group: "general".into(),
+                name: "Device state".into(),
+                unit: String::new(),
+            },
+            FieldRec {
+                device: 0x222222,
+                index: 1,
+                class: "MCU".into(),
+                instance: "combi".into(),
+                group: "general".into(),
+                name: "Device state".into(),
+                unit: String::new(),
+            },
+        ];
+
+        disambiguate_instances(&mut metas, &mut fields);
+
+        assert_eq!(metas[0].instance, "combi-111111");
+        assert_eq!(metas[1].instance, "combi-222222");
+        assert_eq!(fields[0].instance, "combi-111111");
+        assert_eq!(fields[1].instance, "combi-222222");
+    }
+
+    #[test]
+    fn new_discovered_field_defaults_disabled_with_suggested_path() {
+        let mut cfg = FieldsConfig::default();
+        let field = sample_field("combi");
+
+        assert!(merge_field_config(&mut cfg, &field));
+        assert_eq!(cfg.fields.len(), 1);
+
+        let entry = &cfg.fields[0];
+        assert_eq!(entry.device, "0x123456");
+        assert_eq!(entry.index, "7");
+        assert!(!entry.enabled);
+        assert_eq!(
+            entry.suggested_path,
+            "electrical.inverters.combi.dc.voltage"
+        );
+        assert_eq!(entry.path, entry.suggested_path);
+    }
+
+    #[test]
+    fn customized_path_survives_device_name_change() {
+        let mut cfg = FieldsConfig::default();
+        let original = sample_field("old-name");
+        merge_field_config(&mut cfg, &original);
+
+        cfg.fields[0].enabled = true;
+        cfg.fields[0].path = "electrical.inverters.house.dc.voltage".into();
+
+        let renamed = sample_field("new-name");
+        assert!(merge_field_config(&mut cfg, &renamed));
+
+        let entry = &cfg.fields[0];
+        assert!(entry.enabled);
+        assert_eq!(entry.instance, "new-name");
+        assert_eq!(entry.path, "electrical.inverters.house.dc.voltage");
+        assert_eq!(
+            entry.suggested_path,
+            "electrical.inverters.new-name.dc.voltage"
+        );
+    }
+
+    #[test]
+    fn untouched_default_path_follows_new_suggestion() {
+        let mut cfg = FieldsConfig::default();
+        merge_field_config(&mut cfg, &sample_field("old-name"));
+
+        assert!(merge_field_config(&mut cfg, &sample_field("new-name")));
+        assert_eq!(
+            cfg.fields[0].path,
+            "electrical.inverters.new-name.dc.voltage"
+        );
+    }
+
+    #[test]
+    fn new_device_metadata_defaults_off() {
+        let mut cfg = FieldsConfig::default();
+        let d = DeviceMetaRec {
+            device: 0x123456,
+            class: "CHG".into(),
+            instance: "fwd-charger".into(),
+            name: "CHG Fwd Charger".into(),
+            article: "44320405".into(),
+        };
+        assert!(merge_device_config(&mut cfg, &d));
+        let dc = configured_device(&cfg, d.device).unwrap();
+        assert!(!dc.publish_name);
+        assert!(!dc.publish_manufacturer_name);
+        assert!(!dc.publish_model);
+    }
+
+    #[test]
+    fn custom_field_base_is_used_for_device_metadata() {
+        let d = DeviceMetaRec {
+            device: 0x123456,
+            class: "CHG".into(),
+            instance: "fwd-charger".into(),
+            name: "CHG Fwd Charger".into(),
+            article: "44320405".into(),
+        };
+        let mut cfg = FieldsConfig::default();
+        merge_device_config(&mut cfg, &d);
+        cfg.devices[0].publish_name = true;
+        cfg.devices[0].publish_model = true;
+        cfg.devices[0].publish_manufacturer_name = false;
+        cfg.fields.push(FieldConfig {
+            device: device_key(d.device),
+            class: "CHG".into(),
+            instance: "fwd-charger".into(),
+            group: "monitoring".into(),
+            index: "2".into(),
+            field: "Output 1".into(),
+            unit: "V".into(),
+            enabled: true,
+            suggested_path: "electrical.chargers.fwd-charger.voltage".into(),
+            path: "electrical.chargers.fwdAC.voltage".into(),
+        });
+
+        let bases = effective_bases_for_device(&d, &cfg);
+        assert!(bases.contains("electrical.chargers.fwdAC"));
+        assert!(!bases.contains("electrical.chargers.fwd-charger"));
+
+        let published = HashSet::from([d.device]);
+        let batch = String::from_utf8(static_meta_batch(&[d], &published, &cfg)).unwrap();
+        assert!(batch.contains("electrical.chargers.fwdAC.name"));
+        assert!(batch.contains("electrical.chargers.fwdAC.manufacturer.model"));
+        assert!(!batch.contains("manufacturer.name"));
+        assert!(!batch.contains("electrical.chargers.fwd-charger"));
+    }
+}
+
+/// Resolve the effective Signal K base path(s) for a device from enabled fields.
+///
+/// For each built-in suggested base, take the suffix of a field's suggested path
+/// and apply that same suffix to the user's configured path. This makes a user
+/// rename such as `fwd-charger` -> `fwdAC` carry through to static metadata too,
+/// without hard-coding vessel-specific names in Rust.
+fn effective_bases_for_device(d: &DeviceMetaRec, config: &FieldsConfig) -> HashSet<String> {
+    let device = device_key(d.device);
+    let mut bases = HashSet::new();
+
+    for f in config
+        .fields
+        .iter()
+        .filter(|f| f.device == device && f.enabled && !f.path.trim().is_empty())
+    {
+        for suggested_base in sk_bases(&d.class, &d.instance) {
+            let suffix = if f.suggested_path == suggested_base {
+                ""
+            } else if let Some(suffix) = f
+                .suggested_path
+                .strip_prefix(&(suggested_base.clone() + "."))
+            {
+                // Restore the dot so we can remove exactly the mapped leaf suffix
+                // from the custom publication path.
+                // `suffix_owned` lives only in this branch, so handle it inline.
+                let suffix = format!(".{suffix}");
+                if let Some(custom_base) = f.path.strip_suffix(&suffix) {
+                    if !custom_base.is_empty() {
+                        bases.insert(custom_base.to_string());
+                    }
+                }
+                continue;
+            } else {
+                continue;
+            };
+
+            if suffix.is_empty() {
+                bases.insert(f.path.clone());
+            }
+        }
+    }
+
+    bases
+}
+
+/// Build the one-shot Signal K static metadata batch.
+///
+/// Support for device name, manufacturer name and model remains in the generic
+/// sidecar, but every item is explicitly opt-in through `[[devices]]` in the
+/// TOML. Metadata is emitted at the effective user-configured base path(s).
+fn static_meta_batch(
+    devs: &[DeviceMetaRec],
+    published: &HashSet<DeviceId>,
+    config: &FieldsConfig,
+) -> Vec<u8> {
     let mut batch = Vec::new();
     for d in devs {
         if !published.contains(&d.device) {
             continue;
         }
+        let Some(dc) = configured_device(config, d.device) else {
+            continue;
+        };
+        if !dc.publish_name && !dc.publish_manufacturer_name && !dc.publish_model {
+            continue;
+        }
+
         let mut values = Vec::new();
-        for base in sk_bases(&d.class, &d.instance) {
-            if !d.name.is_empty() {
+        for base in effective_bases_for_device(d, config) {
+            if dc.publish_name && !d.name.is_empty() {
                 values.push(json!({ "path": format!("{base}.name"), "value": d.name }));
             }
-            values.push(
-                json!({ "path": format!("{base}.manufacturer.name"), "value": "Mastervolt" }),
-            );
-            if !d.article.is_empty() {
-                values.push(
-                    json!({ "path": format!("{base}.manufacturer.model"), "value": d.article }),
-                );
+            if dc.publish_manufacturer_name {
+                values.push(json!({
+                    "path": format!("{base}.manufacturer.name"),
+                    "value": "Mastervolt"
+                }));
+            }
+            if dc.publish_model && !d.article.is_empty() {
+                values.push(json!({
+                    "path": format!("{base}.manufacturer.model"),
+                    "value": d.article
+                }));
             }
         }
         if values.is_empty() {

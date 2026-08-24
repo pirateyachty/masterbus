@@ -51,15 +51,48 @@ TUI feels instant.
 ## Reading data continuously
 
 For pulling data off the bus in a long-running stream, use
-`masterbus-signalk`. It connects to the bus, subscribes to every field,
-and emits Signal K deltas (newline-delimited JSON) on a TCP socket.
+`masterbus-signalk`. It discovers the devices and monitoring fields on the bus
+and serves Signal K deltas (newline-delimited JSON) on a TCP socket.
 
     masterbus-signalk 0.0.0.0:3009
 
-Then `nc localhost 3009` shows the live stream. Any language that can
-read a TCP socket and parse JSON can consume this — Python, Node,
-shell, anything. Despite the name it works fine without a Signal K
-server: it's just JSON lines.
+On first discovery it creates `masterbus-signalk-fields.toml` in the current
+working directory. **Discovered fields are not published automatically.** Each
+new field starts with `enabled = false`; edit the TOML and explicitly enable the
+fields you want.
+
+Each field also has both a mapper-provided `suggested_path` and a user-editable
+`path`, so you can keep the suggested Signal K naming or use names that make more
+sense for your installation:
+
+```toml
+[[fields]]
+device = "0x123456"
+class = "CHG"
+instance = "fwd-charger"
+group = "monitoring"
+index = "2"
+field = "Output 1"
+unit = "V"
+enabled = true
+suggested_path = "electrical.chargers.fwd-charger.voltage"
+path = "electrical.chargers.fwdAC.voltage"
+```
+
+Static device metadata is also opt-in per device. `name`,
+`manufacturer.name`, and `manufacturer.model` can be enabled independently in
+the same TOML. If you customize a field's base path, enabled metadata follows
+that customized base too.
+
+Existing choices are preserved when discovery runs again. New devices or fields
+that appear later are appended disabled, so a device that was powered off at
+startup can be discovered without requiring a restart.
+
+After enabling fields, restart `masterbus-signalk` so it reloads the TOML.
+
+Then `nc localhost 3009` shows the live stream. Any language that can read a TCP
+socket and parse JSON can consume this — Python, Node, shell, anything. Despite
+the name it works fine without a Signal K server: it's just JSON lines.
 
 ## Writing values
 

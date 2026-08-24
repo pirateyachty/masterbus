@@ -7,6 +7,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`masterbus-signalk`: per-field publication configuration.** Discovery now
+  writes `masterbus-signalk-fields.toml`, recording every discovered monitoring
+  field with its stable MasterBus device address + field index, built-in
+  `suggested_path`, user-editable `path`, and explicit `enabled` flag. New fields
+  default off, existing choices survive rediscovery, and unmapped fields are
+  still inventoried so users can supply custom Signal K paths without changing
+  the Rust mapper.
+- **`masterbus-signalk`: group-aware, broader device mappings.** Monitoring
+  mappings now use the discovered MasterBus group to disambiguate repeated field
+  names and cover the additional Mastervolt classes/schemas exercised on the
+  reference bus, including Mass Combi Ultra, AC chargers, MasterShunt, EasyView,
+  Mac/Magic DC/DC, and the existing battery/MAC/APR families.
+- **`masterbus-signalk`: user-configurable static device metadata.** Device
+  `name`, `manufacturer.name`, and `manufacturer.model` are independently
+  opt-in. Metadata follows the effective user-customized Signal K base path, so
+  installation-specific names stay consistent without being hard-coded into the
+  mapper.
+- **`masterbus-signalk`: runtime discovery of newly appearing devices.** The
+  sidecar keeps its initial device subscriptions/configuration when known devices
+  go quiet, while an Alive event for a previously unseen device triggers schema
+  discovery and adds its fields to the TOML disabled by default.
 - **Events resolve their target device by name.** A device's event definitions
   (`Event N source / target / command / data`) reference their target device by
   a bare index that is a position in the address-sorted bus device list. Wire
