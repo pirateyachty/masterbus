@@ -47,6 +47,7 @@ pub(super) fn sk_bases(class: &str, id: &str) -> Vec<String> {
 pub(super) fn map_field(
     class: &str,
     id: &str,
+    _group: &str,
     name: &str,
     unit: &str,
     value: &Value,
@@ -223,7 +224,7 @@ mod tests {
 
     /// `map_field` for a float monitoring value.
     fn f(class: &str, name: &str, unit: &str, v: f32) -> Option<(String, serde_json::Value)> {
-        map_field(class, "1", name, unit, &Value::Float(v))
+        map_field(class, "1", "", name, unit, &Value::Float(v))
     }
 
     /// The path `map_field` produced, for assertions that only care about routing.
@@ -292,7 +293,7 @@ mod tests {
     /// "Standby" is the inverse of Signal K's `enabled`.
     #[test]
     fn mac_standby_inverts_into_enabled() {
-        let on = map_field("MAC", "1", "Standby", "", &Value::Boolean(false));
+        let on = map_field("MAC", "1", "", "Standby", "", &Value::Boolean(false));
         assert_eq!(
             on,
             Some((
@@ -300,7 +301,7 @@ mod tests {
                 serde_json::Value::Bool(true)
             ))
         );
-        let off = map_field("MAC", "1", "Standby", "", &Value::Boolean(true));
+        let off = map_field("MAC", "1", "", "Standby", "", &Value::Boolean(true));
         assert_eq!(
             off,
             Some((
@@ -318,14 +319,14 @@ mod tests {
             options: vec!["Off".into(), "Bulk".into()],
         };
         assert_eq!(
-            map_field("MAC", "1", "Charge state", "", &list(1)),
+            map_field("MAC", "1", "", "Charge state", "", &list(1)),
             Some((
                 "electrical.chargers.1.chargingMode".into(),
                 serde_json::Value::String("bulk".into())
             ))
         );
         assert_eq!(
-            path(map_field("MAC", "1", "Device state", "", &list(0))).as_deref(),
+            path(map_field("MAC", "1", "", "Device state", "", &list(0))).as_deref(),
             Some("electrical.chargers.1.deviceMode")
         );
     }

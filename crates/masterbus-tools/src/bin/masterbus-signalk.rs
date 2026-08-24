@@ -101,6 +101,7 @@ struct DeviceMetaRec {
 struct FieldMeta {
     class: String,
     instance: String,
+    group: String,
     name: String,
     unit: String,
 }
@@ -206,6 +207,27 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
         });
     }
 
+    // Allow MasterBus discovery to populate before taking the device snapshot.
+    // Devices may announce at different times, especially on slower hardware.
+    let discovery_start = std::time::Instant::now();
+    let mut last_count = 0usize;
+
+    loop {
+        let count = bus.devices_all().len();
+
+        if count != last_count {
+            eprintln!("masterbus-signalk: discovered {count} device(s)");
+            last_count = count;
+        }
+
+        if discovery_start.elapsed() >= Duration::from_secs(10) {
+            eprintln!("masterbus-signalk: discovery complete with {count} device(s)");
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     // Discover the monitoring menu of every device, recording each field with its
     // (sanitized) group so the mapping file can gate it.
     let devices = bus.devices_all();
@@ -299,6 +321,7 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
                 FieldMeta {
                     class: f.class.clone(),
                     instance: f.instance.clone(),
+                    group: f.group.clone(),
                     name: f.name.clone(),
                     unit: f.unit.clone(),
                 },
@@ -350,7 +373,7 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
                 if have_clients
                     && let Some(m) = meta.get(&(u.device, u.field))
                     && let Some((path, value)) =
-                        map_field(&m.class, &m.instance, &m.name, &m.unit, &u.value)
+                        map_field(&m.class, &m.instance, &m.group, &m.name, &m.unit, &u.value)
                 {
                     latest.insert(path, value);
                 }
