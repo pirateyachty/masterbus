@@ -26,6 +26,10 @@
 //! `true`/`false` flags while the service is stopped. Without `MAPPING`, every
 //! mapped field is published.
 //!
+//! At startup every discovered monitoring field is also classified as `KNOWN`
+//! (with its suggested Signal K path) or `UNMAPPED`. This inventory is diagnostic
+//! only for now; it does not change the existing publication gating behavior.
+//!
 //! Besides live values, each published device also emits static `name` and
 //! `manufacturer` (name + article/model) metadata once per client connection —
 //! see [`static_meta_batch`].
@@ -43,7 +47,7 @@ use serde_json::json;
 #[path = "masterbus-signalk/mapping.rs"]
 mod mapping;
 
-use mapping::{map_field, sk_bases, sk_units};
+use mapping::{map_field, sk_bases, sk_units, suggested_path};
 
 /// Default TCP listen address.
 const DEFAULT_LISTEN: &str = "0.0.0.0:3009";
@@ -282,6 +286,35 @@ fn run(bus: MasterBus, listen: &str, mapping_path: Option<&Path>) -> std::io::Re
             }
         }
     }
+
+    // Classify every discovered field against the built-in mapper. Unknown
+    // classes and new fields on known classes are reported but are not assigned
+    // guessed Signal K paths. This inventory is independent of publication
+    // gating, so even fields that are currently disabled remain visible here.
+    let mut known_fields = 0usize;
+    let mut unmapped_fields = 0usize;
+    for f in &fields {
+        match suggested_path(&f.class, &f.instance, &f.group, &f.name, &f.unit) {
+            Some(path) => {
+                known_fields += 1;
+                eprintln!(
+                    "KNOWN class={} instance={} group={} index={:?} field={:?} unit={:?} path={}",
+                    f.class, f.instance, f.group, f.index, f.name, f.unit, path
+                );
+            }
+            None => {
+                unmapped_fields += 1;
+                eprintln!(
+                    "UNMAPPED class={} instance={} group={} index={:?} field={:?} unit={:?}",
+                    f.class, f.instance, f.group, f.index, f.name, f.unit
+                );
+            }
+        }
+    }
+    eprintln!(
+        "masterbus-signalk: mapping inventory: {known_fields} known, {unmapped_fields} unmapped, {} total",
+        fields.len()
+    );
 
     // Load / auto-fill / rewrite the mapping file (if configured).
     let mut mapping = mapping_path.map(load_mapping).unwrap_or_default();

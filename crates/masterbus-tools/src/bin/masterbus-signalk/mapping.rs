@@ -828,6 +828,34 @@ pub(super) fn map_field(
     mapped
 }
 
+/// Return the Signal K path a discovered field would use, without requiring a
+/// live monitoring value. This is used during discovery to classify fields as
+/// known or unmapped before subscriptions start producing updates.
+///
+/// The mapper's routing depends on class/group/name/unit and, for a few state
+/// fields, on the value variant. Probe the common variants so classification
+/// reuses the real mapping rules instead of maintaining a second copy.
+pub(super) fn suggested_path(
+    class: &str,
+    id: &str,
+    group: &str,
+    name: &str,
+    unit: &str,
+) -> Option<String> {
+    let probes = [
+        Value::Float(0.0),
+        Value::Boolean(false),
+        Value::List {
+            index: 0,
+            options: vec!["probe".into()],
+        },
+    ];
+
+    probes
+        .into_iter()
+        .find_map(|value| map_field(class, id, group, name, unit, &value).map(|(path, _)| path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +872,22 @@ mod tests {
 
     fn path(r: Option<(String, serde_json::Value)>) -> Option<String> {
         r.map(|(p, _)| p)
+    }
+
+    #[test]
+    fn suggested_path_classifies_known_field_without_live_value() {
+        assert_eq!(
+            suggested_path("MCU", "combi", "ac-inputs", "Mains", "V").as_deref(),
+            Some("electrical.inverters.combi.acInputs.mains.voltage")
+        );
+    }
+
+    #[test]
+    fn suggested_path_rejects_unknown_field() {
+        assert_eq!(
+            suggested_path("XYZ", "mystery", "monitoring", "Unknown thing", "V"),
+            None
+        );
     }
 
     #[test]
