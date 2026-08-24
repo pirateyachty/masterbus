@@ -37,11 +37,11 @@ pub(super) fn sk_bases(class: &str, id: &str) -> Vec<String> {
             format!("electrical.batteries.{id}"),
             format!("electrical.masterbus.{id}"),
         ],
-        "CMR" => vec![
+        "CMR" | "MCU" => vec![
             format!("electrical.inverters.{id}"),
             format!("electrical.chargers.{id}"),
+            format!("electrical.masterbus.{id}"),
         ],
-        "MCU" => vec![format!("electrical.masterbus.{id}")],
         "MAC" | "INT" | "CHG" => vec![
             format!("electrical.chargers.{id}"),
             format!("electrical.masterbus.{id}"),
@@ -305,133 +305,195 @@ pub(super) fn map_field(
 
         // ---------------------------------------------------------------------
         // MCU — Mass Combi Ultra.
-        // Keep the complete MCU device under the MasterBus namespace because it
-        // combines inverter, charger, multiple AC inputs/outputs, solar and
-        // cluster values in one device.
+        //
+        // The MCU is fundamentally an inverter/charger, so normal electrical
+        // values are published under the standard inverter/charger namespaces.
+        // The MasterBus namespace is reserved for device-specific state that
+        // does not have a clean standard Signal K home.
         // ---------------------------------------------------------------------
         "MCU" => {
-            let b = format!("electrical.masterbus.{id}");
+            let inv = format!("electrical.inverters.{id}");
+            let chg = format!("electrical.chargers.{id}");
+            let mb = format!("electrical.masterbus.{id}");
+
             match (group, name, unit) {
+                // -------------------------------------------------------------
+                // General device state
+                // -------------------------------------------------------------
                 ("general", "Device state", _) => label_value(value, false)
                     .or_else(|| text_value(value))
-                    .map(|v| (format!("{b}.deviceState"), v)),
+                    .map(|v| (format!("{mb}.deviceState"), v)),
+
                 ("general", "Mains fuse", "A") => {
-                    numeric(value).map(|v| (format!("{b}.mainsFuse"), v))
+                    numeric(value).map(|v| (format!("{inv}.mainsFuse"), v))
                 }
+
                 ("general", "Inverter", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.inverter.state"), v))
+                    bool_or_label(value).map(|v| (format!("{inv}.state"), v))
                 }
+
                 ("general", "User mode", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.userMode"), v))
+                    bool_or_label(value).map(|v| (format!("{mb}.userMode"), v))
                 }
+
                 ("general", "AC in state", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.acInState"), v))
+                    bool_or_label(value).map(|v| (format!("{inv}.acInState"), v))
                 }
+
                 ("general", "AC out state", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.acOutState"), v))
+                    bool_or_label(value).map(|v| (format!("{inv}.acOutState"), v))
                 }
+
                 ("general", "Main charger", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.mainCharger.state"), v))
+                    bool_or_label(value).map(|v| (format!("{chg}.state"), v))
                 }
+
                 ("general", "Sec. charger", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.secondaryCharger.state"), v))
+                    bool_or_label(value).map(|v| (format!("{chg}.secondary.state"), v))
                 }
+
                 ("general", "Solar charger", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.solarCharger.state"), v))
+                    bool_or_label(value).map(|v| (format!("{chg}.solar.state"), v))
                 }
 
+                // -------------------------------------------------------------
+                // Main battery / DC side
+                // -------------------------------------------------------------
                 ("battery--dc-", "Main charger", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.dc.mainCharger.state"), v))
+                    bool_or_label(value).map(|v| (format!("{chg}.state"), v))
                 }
+
                 ("battery--dc-", "Main battery", "V") => {
-                    numeric(value).map(|v| (format!("{b}.dc.voltage"), v))
+                    numeric(value).map(|v| (format!("{inv}.dc.voltage"), v))
                 }
+
                 ("battery--dc-", "Main battery", "A") => {
-                    numeric(value).map(|v| (format!("{b}.dc.current"), v))
+                    numeric(value).map(|v| (format!("{inv}.dc.current"), v))
                 }
+
                 ("battery--dc-", "Main battery", "°C") => {
-                    celsius_to_kelvin(value).map(|v| (format!("{b}.dc.temperature"), v))
+                    celsius_to_kelvin(value).map(|v| (format!("{inv}.dc.temperature"), v))
                 }
 
+                // -------------------------------------------------------------
+                // Secondary charger
+                // -------------------------------------------------------------
                 ("sec--charger", "Sec. charger", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.secondaryCharger.state"), v))
+                    bool_or_label(value).map(|v| (format!("{chg}.secondary.state"), v))
                 }
+
                 ("sec--charger", "Sec. battery", "V") => {
-                    numeric(value).map(|v| (format!("{b}.secondaryCharger.voltage"), v))
+                    numeric(value).map(|v| (format!("{chg}.secondary.voltage"), v))
                 }
+
                 ("sec--charger", "Sec. battery", "A") => {
-                    numeric(value).map(|v| (format!("{b}.secondaryCharger.current"), v))
+                    numeric(value).map(|v| (format!("{chg}.secondary.current"), v))
                 }
 
+                // -------------------------------------------------------------
+                // Cluster AC input
+                //
+                // These are aggregate values for the MCU inverter cluster rather
+                // than measurements belonging only to this individual unit.
+                // -------------------------------------------------------------
                 ("cluster-ac-in", "Mains", "V") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acInMains.voltage"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acInMains.voltage"), v))
                 }
+
                 ("cluster-ac-in", "Mains", "A") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acInMains.current"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acInMains.current"), v))
                 }
+
                 ("cluster-ac-in", "Mains", "W") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acInMains.power"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acInMains.power"), v))
                 }
+
                 ("cluster-ac-in", "Generator", "V") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acInGenerator.voltage"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acInGenerator.voltage"), v))
                 }
+
                 ("cluster-ac-in", "Generator", "A") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acInGenerator.current"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acInGenerator.current"), v))
                 }
+
                 ("cluster-ac-in", "Generator", "W") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acInGenerator.power"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acInGenerator.power"), v))
                 }
 
+                // -------------------------------------------------------------
+                // Cluster AC output
+                // -------------------------------------------------------------
                 ("cluster-ac-out", "AC Output 1", "V") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acOut1.voltage"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acOut1.voltage"), v))
                 }
+
                 ("cluster-ac-out", "AC Output 1", "W") => {
-                    numeric(value).map(|v| (format!("{b}.cluster.acOut1.power"), v))
+                    numeric(value).map(|v| (format!("{inv}.cluster.acOut1.power"), v))
                 }
 
+                // -------------------------------------------------------------
+                // This MCU's individual AC inputs
+                // -------------------------------------------------------------
                 ("ac-inputs", "Mains", "V") => {
-                    numeric(value).map(|v| (format!("{b}.acInputs.mains.voltage"), v))
+                    numeric(value).map(|v| (format!("{inv}.acInputs.mains.voltage"), v))
                 }
+
                 ("ac-inputs", "Mains", "A") => {
-                    numeric(value).map(|v| (format!("{b}.acInputs.mains.current"), v))
+                    numeric(value).map(|v| (format!("{inv}.acInputs.mains.current"), v))
                 }
+
                 ("ac-inputs", "Mains", "W") => {
-                    numeric(value).map(|v| (format!("{b}.acInputs.mains.power"), v))
+                    numeric(value).map(|v| (format!("{inv}.acInputs.mains.power"), v))
                 }
+
                 ("ac-inputs", "Generator", "V") => {
-                    numeric(value).map(|v| (format!("{b}.acInputs.generator.voltage"), v))
+                    numeric(value).map(|v| (format!("{inv}.acInputs.generator.voltage"), v))
                 }
+
                 ("ac-inputs", "Generator", "A") => {
-                    numeric(value).map(|v| (format!("{b}.acInputs.generator.current"), v))
+                    numeric(value).map(|v| (format!("{inv}.acInputs.generator.current"), v))
                 }
+
                 ("ac-inputs", "Generator", "W") => {
-                    numeric(value).map(|v| (format!("{b}.acInputs.generator.power"), v))
+                    numeric(value).map(|v| (format!("{inv}.acInputs.generator.power"), v))
                 }
 
+                // -------------------------------------------------------------
+                // This MCU's individual AC outputs
+                // -------------------------------------------------------------
                 ("ac-outputs", "AC Output 1", "V") => {
-                    numeric(value).map(|v| (format!("{b}.acOutputs.output1.voltage"), v))
-                }
-                ("ac-outputs", "AC Output 1", "A") => {
-                    numeric(value).map(|v| (format!("{b}.acOutputs.output1.current"), v))
-                }
-                ("ac-outputs", "AC Output 1", "W") => {
-                    numeric(value).map(|v| (format!("{b}.acOutputs.output1.power"), v))
-                }
-                ("ac-outputs", "AC Output 2", "V") => {
-                    numeric(value).map(|v| (format!("{b}.acOutputs.output2.voltage"), v))
-                }
-                ("ac-outputs", "AC Output 2", "A") => {
-                    numeric(value).map(|v| (format!("{b}.acOutputs.output2.current"), v))
-                }
-                ("ac-outputs", "AC Output 2", "W") => {
-                    numeric(value).map(|v| (format!("{b}.acOutputs.output2.power"), v))
+                    numeric(value).map(|v| (format!("{inv}.acOutputs.output1.voltage"), v))
                 }
 
-                ("solar-input", "State", _) => {
-                    bool_or_label(value).map(|v| (format!("{b}.solarInput.state"), v))
+                ("ac-outputs", "AC Output 1", "A") => {
+                    numeric(value).map(|v| (format!("{inv}.acOutputs.output1.current"), v))
                 }
+
+                ("ac-outputs", "AC Output 1", "W") => {
+                    numeric(value).map(|v| (format!("{inv}.acOutputs.output1.power"), v))
+                }
+
+                ("ac-outputs", "AC Output 2", "V") => {
+                    numeric(value).map(|v| (format!("{inv}.acOutputs.output2.voltage"), v))
+                }
+
+                ("ac-outputs", "AC Output 2", "A") => {
+                    numeric(value).map(|v| (format!("{inv}.acOutputs.output2.current"), v))
+                }
+
+                ("ac-outputs", "AC Output 2", "W") => {
+                    numeric(value).map(|v| (format!("{inv}.acOutputs.output2.power"), v))
+                }
+
+                // -------------------------------------------------------------
+                // Integrated solar charger
+                // -------------------------------------------------------------
+                ("solar-input", "State", _) => {
+                    bool_or_label(value).map(|v| (format!("{chg}.solar.state"), v))
+                }
+
                 ("solar-input", "Solar Input", "W") => {
-                    numeric(value).map(|v| (format!("{b}.solarInput.power"), v))
+                    numeric(value).map(|v| (format!("{chg}.solar.power"), v))
                 }
 
                 _ => None,
@@ -827,11 +889,11 @@ mod tests {
     fn mcu_same_label_is_disambiguated_by_group() {
         assert_eq!(
             path(f("MCU", "cluster-ac-in", "Mains", "V", 230.0)).as_deref(),
-            Some("electrical.masterbus.1.cluster.acInMains.voltage")
+            Some("electrical.inverters.1.cluster.acInMains.voltage")
         );
         assert_eq!(
             path(f("MCU", "ac-inputs", "Mains", "V", 230.0)).as_deref(),
-            Some("electrical.masterbus.1.acInputs.mains.voltage")
+            Some("electrical.inverters.1.acInputs.mains.voltage")
         );
     }
 
