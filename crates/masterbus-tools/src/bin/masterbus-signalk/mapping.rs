@@ -1,370 +1,886 @@
 //! Signal K path mapping and unit conversion for MasterBus monitoring fields.
+//!
+//! This module deliberately keeps vessel-specific naming out of the Rust code.
+//! Device instances come from MasterBus discovery, while group-aware rules map
+//! known Mastervolt classes to sensible Signal K paths. Device-specific/user
+//! overrides can be layered on top later without changing the transport code.
+
 use masterbus::Value;
 
-/// SI unit for a published Signal K path, keyed on its leaf segment. Signal K's
-/// own metadata already carries units for the standard leaves (`voltage`,
-/// `temperature`, …), but our non-standard nested leaves (`battery.temperature`,
-/// `field.current`, `input.voltage`, `voltageSense`, …) are unknown to the
-/// server, so it can't unit-convert them without a `meta` delta. We publish meta
-/// for *every* known leaf (re-affirming the standard ones is harmless); `None`
-/// leaves (`chargingMode`, `deviceMode`, `enabled`, `name`) carry no unit.
+/// SI unit for a published Signal K path, keyed on its leaf segment.
+///
+/// Standard Signal K leaves already have server-side metadata, but the MasterBus
+/// vendor namespace contains additional leaves, so the sidecar emits unit metadata
+/// for any numeric leaf it knows about.
 pub(super) fn sk_units(path: &str) -> Option<&'static str> {
     Some(match path.rsplit('.').next().unwrap_or("") {
-        "stateOfCharge" => "ratio",
-        "timeRemaining" => "s",
+        "stateOfCharge" | "currentLimitRatio" | "backlight" => "ratio",
+        "timeRemaining" | "remaining" | "standbyTime" | "pageDuration" => "s",
         "dischargeSinceFull" => "C",
         "temperature" => "K",
-        "voltage" | "voltageSense" => "V",
-        "current" | "currentLimit" => "A",
-        "power" => "W",
+        "voltage" | "voltageSense" | "senseVoltage" | "altVoltage" => "V",
+        "current" | "currentLimit" | "fieldCurrent" | "mainsFuse" => "A",
+        "power" | "solarInput" => "W",
         "frequency" | "revolutions" => "Hz",
         _ => return None,
     })
 }
 
-/// Signal K base path(s) for a device class — the node(s) that carry this
-/// device's values, and thus its static `name` / `manufacturer` metadata. The
-/// CombiMaster spans two categories. Keep this in sync with [`map_field`]'s
-/// per-class path prefixes.
+/// Signal K base path(s) for a device class.
+///
+/// These are used for static device metadata (`name`, manufacturer/model). A
+/// device may publish both to a standard Signal K category and to the MasterBus
+/// vendor namespace.
 pub(super) fn sk_bases(class: &str, id: &str) -> Vec<String> {
     match class {
-        "BAT" => vec![format!("electrical.batteries.{id}")],
+        "BAT" | "MSH" => vec![
+            format!("electrical.batteries.{id}"),
+            format!("electrical.masterbus.{id}"),
+        ],
         "CMR" => vec![
             format!("electrical.inverters.{id}"),
             format!("electrical.chargers.{id}"),
         ],
-        "MAC" => vec![format!("electrical.chargers.{id}")],
-        "APR" => vec![format!("electrical.alternators.{id}")],
+        "MCU" => vec![format!("electrical.masterbus.{id}")],
+        "MAC" | "INT" | "CHG" => vec![
+            format!("electrical.chargers.{id}"),
+            format!("electrical.masterbus.{id}"),
+        ],
+        "APR" => vec![
+            format!("electrical.alternators.{id}"),
+            format!("electrical.masterbus.{id}"),
+        ],
+        "DIS" => vec![format!("electrical.masterbus.{id}")],
         _ => vec![],
     }
 }
 
-/// Map a (device-class, field) pair to a Signal K path and SI value.
+/// Convert a user/device-provided label into a stable Signal K path segment.
 ///
-/// Returns `None` for fields without a mapping (they are simply not emitted).
-/// Extend per device class; the matched names/units are exactly those the device
-/// reports for its monitoring fields.
+/// This is intentionally generic: EasyView switch names are user-defined, so a
+/// switch called "Fwd DC/DC" becomes `fwd-dc-dc` without any vessel-specific
+/// lookup table.
+fn field_slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+
+    for ch in s.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            out.push(ch.to_ascii_lowercase());
+            pending_dash = false;
+        } else {
+            pending_dash = !out.is_empty();
+        }
+    }
+
+    out.trim_end_matches('-').to_string()
+}
+
+fn text_value(value: &Value) -> Option<serde_json::Value> {
+    match value {
+        Value::Boolean(b) => Some(serde_json::Value::Bool(*b)),
+        Value::Float(x) if x.is_finite() => Some(serde_json::Value::from(*x as f64)),
+        Value::List { index, .. } | Value::Eventable { index, .. } => {
+            if let Some(label) = value.label() {
+                Some(serde_json::Value::String(label.to_string()))
+            } else {
+                Some(serde_json::Value::from(*index))
+            }
+        }
+        Value::Text { text, .. } => Some(serde_json::Value::String(text.clone())),
+        Value::DeviceRef { index, .. } => Some(serde_json::Value::from(*index)),
+        Value::Date(d) if d.year > 0 && d.mon > 0 && d.day > 0 => Some(serde_json::Value::String(
+            format!("{:04}-{:02}-{:02}", d.year, d.mon, d.day),
+        )),
+        Value::Time(t) if t.sec >= 0 && t.min >= 0 && t.hour >= 0 => {
+            let prefix = if t.days > 0 {
+                format!("{}d ", t.days)
+            } else {
+                String::new()
+            };
+            Some(serde_json::Value::String(format!(
+                "{prefix}{:02}:{:02}:{:02}",
+                t.hour, t.min, t.sec
+            )))
+        }
+        _ => None,
+    }
+}
+
+fn float_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(x) if x.is_finite() => Some(*x as f64),
+        _ => None,
+    }
+}
+
+fn seconds_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Time(t) if t.sec >= 0 && t.min >= 0 && t.hour >= 0 => Some(
+            t.days as f64 * 86400.0 + t.hour as f64 * 3600.0 + t.min as f64 * 60.0 + t.sec as f64,
+        ),
+        _ => None,
+    }
+}
+
+fn label_value(value: &Value, lowercase: bool) -> Option<serde_json::Value> {
+    value.label().map(|s| {
+        serde_json::Value::String(if lowercase {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_string()
+        })
+    })
+}
+
+fn bool_or_label(value: &Value) -> Option<serde_json::Value> {
+    match value {
+        Value::Boolean(b) => Some(serde_json::Value::Bool(*b)),
+        _ => label_value(value, false).or_else(|| text_value(value)),
+    }
+}
+
+fn celsius_to_kelvin(value: &Value) -> Option<serde_json::Value> {
+    float_value(value).map(|c| serde_json::Value::from(c + 273.15))
+}
+
+fn percent_to_ratio(value: &Value) -> Option<serde_json::Value> {
+    float_value(value).map(|v| serde_json::Value::from(v / 100.0))
+}
+
+fn amp_hours_to_coulombs(value: &Value) -> Option<serde_json::Value> {
+    float_value(value).map(|ah| serde_json::Value::from(ah * 3600.0))
+}
+
+fn rpm_to_hz(value: &Value) -> Option<serde_json::Value> {
+    float_value(value).map(|rpm| serde_json::Value::from(rpm / 60.0))
+}
+
+fn numeric(value: &Value) -> Option<serde_json::Value> {
+    float_value(value).map(serde_json::Value::from)
+}
+
+/// Map a discovered MasterBus field to a Signal K path and value.
+///
+/// Matching is group-aware because several Mastervolt devices expose identical
+/// field labels in different monitoring groups. Returns `None` for fields that
+/// are invalid or genuinely not useful to publish.
 pub(super) fn map_field(
     class: &str,
     id: &str,
-    _group: &str,
+    group: &str,
     name: &str,
     unit: &str,
     value: &Value,
 ) -> Option<(String, serde_json::Value)> {
-    let celsius = match value {
-        Value::Float(x) if x.is_finite() => Some(*x as f64),
-        _ => None,
-    };
-    let float = celsius;
-    let boolean = match value {
-        Value::Boolean(b) => Some(*b),
-        _ => None,
-    };
-    let seconds = match value {
-        Value::Time(t) => Some(
-            t.days as f64 * 86400.0 + t.hour as f64 * 3600.0 + t.min as f64 * 60.0 + t.sec as f64,
-        ),
-        _ => None,
-    };
-    // Selected label of a list/enum field (e.g. the charge-state name), lowercased.
-    let list_label = value.label().map(|s| s.to_ascii_lowercase());
-    let num = |v: f64| serde_json::Value::from(v);
-    let text = |s: String| serde_json::Value::String(s);
+    let unit = unit.trim();
 
-    match class {
-        // Battery monitors → electrical.batteries.<id>
+    let mapped = match class {
+        // ---------------------------------------------------------------------
+        // BAT — Mastervolt lithium batteries / battery monitor.
+        // ---------------------------------------------------------------------
         "BAT" => {
-            let b = format!("electrical.batteries.{id}");
-            match (name, unit) {
-                ("State of charge", _) => {
-                    float.map(|v| (format!("{b}.capacity.stateOfCharge"), num(v / 100.0)))
+            match group {
+                // Individual battery data uses canonical battery paths.
+                "battery" => {
+                    let b = format!("electrical.batteries.{id}");
+                    match (name, unit) {
+                        ("State of charge", "%") => percent_to_ratio(value)
+                            .map(|v| (format!("{b}.capacity.stateOfCharge"), v)),
+                        ("Time remaining", _) => seconds_value(value)
+                            .map(serde_json::Value::from)
+                            .map(|v| (format!("{b}.capacity.timeRemaining"), v)),
+                        ("Voltage", "V") => numeric(value).map(|v| (format!("{b}.voltage"), v)),
+                        ("Current", "A") => numeric(value).map(|v| (format!("{b}.current"), v)),
+                        ("Temperature", "°C") => {
+                            celsius_to_kelvin(value).map(|v| (format!("{b}.temperature"), v))
+                        }
+                        _ => None,
+                    }
                 }
-                ("Battery", "V") => float.map(|v| (format!("{b}.voltage"), num(v))),
-                ("Battery", "A") => float.map(|v| (format!("{b}.current"), num(v))),
-                ("Battery", "\u{b0}C") => {
-                    celsius.map(|c| (format!("{b}.temperature"), num(c + 273.15)))
+
+                // A clustered bank is a separate aggregate view; keep it distinct
+                // from the individual battery until a vessel override promotes it.
+                "cluster" => {
+                    let b = format!("electrical.masterbus.{id}.cluster");
+                    match (name, unit) {
+                        ("State of charge", "%") => {
+                            percent_to_ratio(value).map(|v| (format!("{b}.stateOfCharge"), v))
+                        }
+                        ("Time remaining", _) => seconds_value(value)
+                            .map(serde_json::Value::from)
+                            .map(|v| (format!("{b}.timeRemaining"), v)),
+                        ("Voltage", "V") => numeric(value).map(|v| (format!("{b}.voltage"), v)),
+                        ("Current", "A") => numeric(value).map(|v| (format!("{b}.current"), v)),
+                        ("Temperature", "°C") => {
+                            celsius_to_kelvin(value).map(|v| (format!("{b}.temperature"), v))
+                        }
+                        _ => None,
+                    }
                 }
-                ("Time remaining", _) => {
-                    seconds.map(|s| (format!("{b}.capacity.timeRemaining"), num(s)))
-                }
-                ("Cap. consumed", _) => {
-                    float.map(|ah| (format!("{b}.capacity.dischargeSinceFull"), num(ah * 3600.0)))
+
+                "relay" => {
+                    let slug = field_slug(name);
+                    if slug.is_empty() {
+                        None
+                    } else {
+                        text_value(value)
+                            .map(|v| (format!("electrical.masterbus.{id}.relay.{slug}"), v))
+                    }
                 }
                 _ => None,
             }
         }
-        // CombiMaster (inverter/charger) → electrical.inverters/chargers.<id>
+
+        // ---------------------------------------------------------------------
+        // MSH — MasterShunt-style battery monitor.
+        // ---------------------------------------------------------------------
+        "MSH" if group == "general" => {
+            let b = format!("electrical.batteries.{id}");
+            match (name, unit) {
+                ("State of Charge", "%") => {
+                    percent_to_ratio(value).map(|v| (format!("{b}.capacity.stateOfCharge"), v))
+                }
+                ("Remaining", _) => seconds_value(value)
+                    .map(serde_json::Value::from)
+                    .map(|v| (format!("{b}.capacity.timeRemaining"), v)),
+                ("Cap. consumed", "Ah") => amp_hours_to_coulombs(value)
+                    .map(|v| (format!("{b}.capacity.dischargeSinceFull"), v)),
+                ("Battery", "V") => numeric(value).map(|v| (format!("{b}.voltage"), v)),
+                ("Battery", "A") => numeric(value).map(|v| (format!("{b}.current"), v)),
+                ("Battery", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{b}.temperature"), v))
+                }
+                ("Time", _) => {
+                    text_value(value).map(|v| (format!("electrical.masterbus.{id}.clock.time"), v))
+                }
+                ("Date", _) => {
+                    text_value(value).map(|v| (format!("electrical.masterbus.{id}.clock.date"), v))
+                }
+                _ => None,
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // CMR — existing CombiMaster support retained.
+        // ---------------------------------------------------------------------
         "CMR" => {
             let inv = format!("electrical.inverters.{id}");
             let chg = format!("electrical.chargers.{id}");
             match (name, unit) {
-                ("Battery voltage", "V") => float.map(|v| (format!("{inv}.dc.voltage"), num(v))),
-                ("Battery current", "A") => float.map(|v| (format!("{inv}.dc.current"), num(v))),
-                ("Battery temp.", "\u{b0}C") => {
-                    celsius.map(|c| (format!("{inv}.dc.temperature"), num(c + 273.15)))
-                }
-                ("Output voltage", "V") => float.map(|v| (format!("{inv}.ac.voltage"), num(v))),
-                ("Output power", "W") => float.map(|v| (format!("{inv}.ac.power"), num(v))),
-                ("Output frequency", "Hz") => {
-                    float.map(|v| (format!("{inv}.ac.frequency"), num(v)))
-                }
-                ("Input voltage", "V") => float.map(|v| (format!("{chg}.acin.voltage"), num(v))),
-                ("Input current", "A") => float.map(|v| (format!("{chg}.acin.current"), num(v))),
-                ("Input frequency", "Hz") => {
-                    float.map(|v| (format!("{chg}.acin.frequency"), num(v)))
-                }
-                ("AC IN limit", "A") => float.map(|v| (format!("{chg}.acin.currentLimit"), num(v))),
-                ("Inverter", _) => {
-                    boolean.map(|b| (format!("{inv}.enabled"), serde_json::Value::Bool(b)))
-                }
-                ("Charger", _) => {
-                    boolean.map(|b| (format!("{chg}.enabled"), serde_json::Value::Bool(b)))
-                }
-                _ => None,
-            }
-        }
-        // MAC — DC-DC battery charger (e.g. "MAC Plus 12/24"): a DC source on the
-        // input steps up/down to charge the battery on the output. Canonical
-        // charger `voltage`/`current`/`temperature` describe the output (battery)
-        // side; the DC input side hangs off `.input.*`.
-        //
-        // Unlike the other classes, the MAC schema leaves the unit empty on some
-        // monitoring fields (observed on MAC Plus 12/24: output voltage, output
-        // current, input current, battery voltage sense), so a strict (name,
-        // unit) match drops them silently. Those arms accept the unit *or* the
-        // empty string. The rest keep the strict match on purpose: "Device" and
-        // "Battery" are generic names that only °C tells apart, and wildcarding
-        // them would publish any same-named float as a kelvin temperature.
-        "MAC" => {
-            let chg = format!("electrical.chargers.{id}");
-            match (name, unit.trim()) {
-                ("Output voltage", "V" | "") => float.map(|v| (format!("{chg}.voltage"), num(v))),
-                ("Output current", "A" | "") => float.map(|v| (format!("{chg}.current"), num(v))),
-                ("Input voltage", "V" | "") => {
-                    float.map(|v| (format!("{chg}.input.voltage"), num(v)))
-                }
-                ("Input current", "A" | "") => {
-                    float.map(|v| (format!("{chg}.input.current"), num(v)))
-                }
-                ("Bat. volt sense", "V" | "") => {
-                    float.map(|v| (format!("{chg}.voltageSense"), num(v)))
-                }
-                ("Device", "\u{b0}C") => {
-                    celsius.map(|c| (format!("{chg}.temperature"), num(c + 273.15)))
-                }
-                ("Battery", "\u{b0}C") => {
-                    celsius.map(|c| (format!("{chg}.battery.temperature"), num(c + 273.15)))
-                }
-                // "Device state" (Standby/Charging/Fault/…) → deviceMode: the
-                // device-level state, orthogonal to the charge stage below.
-                ("Device state", _) => list_label.map(|s| (format!("{chg}.deviceMode"), text(s))),
-                // "Charge state" (Bulk/Absorption/Float/…) → chargingMode.
-                ("Charge state", _) => list_label.map(|s| (format!("{chg}.chargingMode"), text(s))),
-                // "Standby" off = charger active.
-                ("Standby", _) => {
-                    boolean.map(|b| (format!("{chg}.enabled"), serde_json::Value::Bool(!b)))
-                }
-                _ => None,
-            }
-        }
-        // APR — Alpha Pro alternator regulator ("APR Alternator"): a
-        // mechanically-driven alternator plus an external shunt/battery monitor.
-        // Canonical alternator `voltage`/`temperature`/`revolutions` describe the
-        // alternator; the battery it charges (sensed both directly and via the
-        // shunt) hangs off `.battery.*`, the engine drive off `.engine.*`.
-        //
-        // Note: "Battery voltage"/"Battery temp." occur in both the Battery and
-        // Shunt groups (same name+unit, different field index); since `map_field`
-        // sees no group they share one path and coalesce to the last sample of
-        // the cycle — harmless, they read the same battery.
-        "APR" => {
-            let alt = format!("electrical.alternators.{id}");
-            match (name, unit) {
-                ("Alternator volt.", "V") => float.map(|v| (format!("{alt}.voltage"), num(v))),
-                ("Sense voltage", "V") => float.map(|v| (format!("{alt}.voltageSense"), num(v))),
-                ("Field current", "A") => float.map(|v| (format!("{alt}.field.current"), num(v))),
-                ("Alternator temp.", "\u{b0}C") => {
-                    celsius.map(|c| (format!("{alt}.temperature"), num(c + 273.15)))
-                }
-                // Shaft speeds → revolutions (Signal K wants Hz, i.e. rpm / 60).
-                ("Alternator shaft", "rpm") => {
-                    float.map(|r| (format!("{alt}.revolutions"), num(r / 60.0)))
-                }
-                ("Engine shaft", "rpm") => {
-                    float.map(|r| (format!("{alt}.engine.revolutions"), num(r / 60.0)))
-                }
-                // "Charger state" (Off/Bulk/Absorption/Float/…) → chargingMode.
-                ("Charger state", _) => {
-                    list_label.map(|s| (format!("{alt}.chargingMode"), text(s)))
-                }
-                // Battery being charged (direct sense + external shunt).
-                ("State of charge", "%") => {
-                    float.map(|v| (format!("{alt}.battery.stateOfCharge"), num(v / 100.0)))
-                }
                 ("Battery voltage", "V") => {
-                    float.map(|v| (format!("{alt}.battery.voltage"), num(v)))
+                    numeric(value).map(|v| (format!("{inv}.dc.voltage"), v))
                 }
                 ("Battery current", "A") => {
-                    float.map(|v| (format!("{alt}.battery.current"), num(v)))
+                    numeric(value).map(|v| (format!("{inv}.dc.current"), v))
                 }
-                ("Battery temp.", "\u{b0}C") => {
-                    celsius.map(|c| (format!("{alt}.battery.temperature"), num(c + 273.15)))
+                ("Battery temp.", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{inv}.dc.temperature"), v))
                 }
+                ("Output voltage", "V") => numeric(value).map(|v| (format!("{inv}.ac.voltage"), v)),
+                ("Output power", "W") => numeric(value).map(|v| (format!("{inv}.ac.power"), v)),
+                ("Output frequency", "Hz") => {
+                    numeric(value).map(|v| (format!("{inv}.ac.frequency"), v))
+                }
+                ("Input voltage", "V") => {
+                    numeric(value).map(|v| (format!("{chg}.acin.voltage"), v))
+                }
+                ("Input current", "A") => {
+                    numeric(value).map(|v| (format!("{chg}.acin.current"), v))
+                }
+                ("Input frequency", "Hz") => {
+                    numeric(value).map(|v| (format!("{chg}.acin.frequency"), v))
+                }
+                ("AC IN limit", "A") => {
+                    numeric(value).map(|v| (format!("{chg}.acin.currentLimit"), v))
+                }
+                ("Inverter", _) => bool_or_label(value).map(|v| (format!("{inv}.enabled"), v)),
+                ("Charger", _) => bool_or_label(value).map(|v| (format!("{chg}.enabled"), v)),
                 _ => None,
             }
         }
+
+        // ---------------------------------------------------------------------
+        // MCU — Mass Combi Ultra.
+        // Keep the complete MCU device under the MasterBus namespace because it
+        // combines inverter, charger, multiple AC inputs/outputs, solar and
+        // cluster values in one device.
+        // ---------------------------------------------------------------------
+        "MCU" => {
+            let b = format!("electrical.masterbus.{id}");
+            match (group, name, unit) {
+                ("general", "Device state", _) => label_value(value, false)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{b}.deviceState"), v)),
+                ("general", "Mains fuse", "A") => {
+                    numeric(value).map(|v| (format!("{b}.mainsFuse"), v))
+                }
+                ("general", "Inverter", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.inverter.state"), v))
+                }
+                ("general", "User mode", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.userMode"), v))
+                }
+                ("general", "AC in state", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.acInState"), v))
+                }
+                ("general", "AC out state", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.acOutState"), v))
+                }
+                ("general", "Main charger", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.mainCharger.state"), v))
+                }
+                ("general", "Sec. charger", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.secondaryCharger.state"), v))
+                }
+                ("general", "Solar charger", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.solarCharger.state"), v))
+                }
+
+                ("battery--dc-", "Main charger", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.dc.mainCharger.state"), v))
+                }
+                ("battery--dc-", "Main battery", "V") => {
+                    numeric(value).map(|v| (format!("{b}.dc.voltage"), v))
+                }
+                ("battery--dc-", "Main battery", "A") => {
+                    numeric(value).map(|v| (format!("{b}.dc.current"), v))
+                }
+                ("battery--dc-", "Main battery", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{b}.dc.temperature"), v))
+                }
+
+                ("sec--charger", "Sec. charger", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.secondaryCharger.state"), v))
+                }
+                ("sec--charger", "Sec. battery", "V") => {
+                    numeric(value).map(|v| (format!("{b}.secondaryCharger.voltage"), v))
+                }
+                ("sec--charger", "Sec. battery", "A") => {
+                    numeric(value).map(|v| (format!("{b}.secondaryCharger.current"), v))
+                }
+
+                ("cluster-ac-in", "Mains", "V") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acInMains.voltage"), v))
+                }
+                ("cluster-ac-in", "Mains", "A") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acInMains.current"), v))
+                }
+                ("cluster-ac-in", "Mains", "W") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acInMains.power"), v))
+                }
+                ("cluster-ac-in", "Generator", "V") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acInGenerator.voltage"), v))
+                }
+                ("cluster-ac-in", "Generator", "A") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acInGenerator.current"), v))
+                }
+                ("cluster-ac-in", "Generator", "W") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acInGenerator.power"), v))
+                }
+
+                ("cluster-ac-out", "AC Output 1", "V") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acOut1.voltage"), v))
+                }
+                ("cluster-ac-out", "AC Output 1", "W") => {
+                    numeric(value).map(|v| (format!("{b}.cluster.acOut1.power"), v))
+                }
+
+                ("ac-inputs", "Mains", "V") => {
+                    numeric(value).map(|v| (format!("{b}.acInputs.mains.voltage"), v))
+                }
+                ("ac-inputs", "Mains", "A") => {
+                    numeric(value).map(|v| (format!("{b}.acInputs.mains.current"), v))
+                }
+                ("ac-inputs", "Mains", "W") => {
+                    numeric(value).map(|v| (format!("{b}.acInputs.mains.power"), v))
+                }
+                ("ac-inputs", "Generator", "V") => {
+                    numeric(value).map(|v| (format!("{b}.acInputs.generator.voltage"), v))
+                }
+                ("ac-inputs", "Generator", "A") => {
+                    numeric(value).map(|v| (format!("{b}.acInputs.generator.current"), v))
+                }
+                ("ac-inputs", "Generator", "W") => {
+                    numeric(value).map(|v| (format!("{b}.acInputs.generator.power"), v))
+                }
+
+                ("ac-outputs", "AC Output 1", "V") => {
+                    numeric(value).map(|v| (format!("{b}.acOutputs.output1.voltage"), v))
+                }
+                ("ac-outputs", "AC Output 1", "A") => {
+                    numeric(value).map(|v| (format!("{b}.acOutputs.output1.current"), v))
+                }
+                ("ac-outputs", "AC Output 1", "W") => {
+                    numeric(value).map(|v| (format!("{b}.acOutputs.output1.power"), v))
+                }
+                ("ac-outputs", "AC Output 2", "V") => {
+                    numeric(value).map(|v| (format!("{b}.acOutputs.output2.voltage"), v))
+                }
+                ("ac-outputs", "AC Output 2", "A") => {
+                    numeric(value).map(|v| (format!("{b}.acOutputs.output2.current"), v))
+                }
+                ("ac-outputs", "AC Output 2", "W") => {
+                    numeric(value).map(|v| (format!("{b}.acOutputs.output2.power"), v))
+                }
+
+                ("solar-input", "State", _) => {
+                    bool_or_label(value).map(|v| (format!("{b}.solarInput.state"), v))
+                }
+                ("solar-input", "Solar Input", "W") => {
+                    numeric(value).map(|v| (format!("{b}.solarInput.power"), v))
+                }
+
+                _ => None,
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // MAC — Mass DC/DC charger.
+        // Supports both Kees' observed schema and the group-aware schema from the
+        // field inventory.
+        // ---------------------------------------------------------------------
+        "MAC" => {
+            let c = format!("electrical.chargers.{id}");
+            match (group, name, unit) {
+                ("status", "Device state", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.deviceMode"), v)),
+                ("status", "Charge state", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.chargingMode"), v)),
+                ("status", "On/Standby", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.state"), v))
+                }
+
+                ("dc-48v", "Thrust 48v [V]", "V") => {
+                    numeric(value).map(|v| (format!("{c}.dc48.voltage"), v))
+                }
+                ("dc-48v", "Thrust 48v [A]", "A") => {
+                    numeric(value).map(|v| (format!("{c}.dc48.current"), v))
+                }
+                ("dc-48v", "Bat. volt sense", "V") => {
+                    numeric(value).map(|v| (format!("{c}.voltageSense"), v))
+                }
+
+                ("dc-24v", "House 24v [V]", "V") => {
+                    numeric(value).map(|v| (format!("{c}.dc24.voltage"), v))
+                }
+                ("dc-24v", "House 24v [A]", "A") => {
+                    numeric(value).map(|v| (format!("{c}.dc24.current"), v))
+                }
+
+                ("remote", "Remote input", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.remoteInput"), v))
+                }
+                ("temperature", "Device", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.temperature"), v))
+                }
+                ("temperature", "Battery", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.battery.temperature"), v))
+                }
+
+                // Compatibility with the older generic MAC schema.
+                (_, "Output voltage", "V" | "") => {
+                    numeric(value).map(|v| (format!("{c}.voltage"), v))
+                }
+                (_, "Output current", "A" | "") => {
+                    numeric(value).map(|v| (format!("{c}.current"), v))
+                }
+                (_, "Input voltage", "V" | "") => {
+                    numeric(value).map(|v| (format!("{c}.input.voltage"), v))
+                }
+                (_, "Input current", "A" | "") => {
+                    numeric(value).map(|v| (format!("{c}.input.current"), v))
+                }
+                (_, "Bat. volt sense", "V" | "") => {
+                    numeric(value).map(|v| (format!("{c}.voltageSense"), v))
+                }
+                (_, "Device", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.temperature"), v))
+                }
+                (_, "Battery", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.battery.temperature"), v))
+                }
+                (_, "Device state", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.deviceMode"), v)),
+                (_, "Charge state", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.chargingMode"), v)),
+                (_, "Standby", _) => match value {
+                    Value::Boolean(b) => {
+                        Some((format!("{c}.enabled"), serde_json::Value::Bool(!*b)))
+                    }
+                    _ => None,
+                },
+
+                _ => None,
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // INT — Mastervolt interface / Mac-Magic DC/DC device.
+        // ---------------------------------------------------------------------
+        "INT" if group == "mac-magic" => {
+            let c = format!("electrical.chargers.{id}");
+            match (name, unit) {
+                ("Mode", _) => bool_or_label(value).map(|v| (format!("{c}.deviceMode"), v)),
+                ("Mac/Magic On", _) => bool_or_label(value).map(|v| (format!("{c}.state"), v)),
+                ("DC Input", "V") => numeric(value).map(|v| (format!("{c}.input.voltage"), v)),
+                ("DC Output", "V") => numeric(value).map(|v| (format!("{c}.voltage"), v)),
+                ("DC Output", "A") => numeric(value).map(|v| (format!("{c}.current"), v)),
+                _ => None,
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // CHG — Mastervolt AC chargers. Different models expose different menu
+        // schemas, so group is essential here.
+        // ---------------------------------------------------------------------
+        "CHG" => {
+            let c = format!("electrical.chargers.{id}");
+            match (group, name, unit) {
+                ("general", "Device state", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.deviceMode"), v))
+                }
+                ("general", "On/Stand-by", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.state"), v))
+                }
+                ("general", "Max. current", "%") => {
+                    percent_to_ratio(value).map(|v| (format!("{c}.currentLimitRatio"), v))
+                }
+                ("general", "State", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.chargingMode"), v)),
+                ("general", "Charger temp", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.temperature"), v))
+                }
+
+                ("output", "Battery name", _) => {
+                    text_value(value).map(|v| (format!("{c}.battery.name"), v))
+                }
+                ("output", "Battery voltage", "V") => {
+                    numeric(value).map(|v| (format!("{c}.voltage"), v))
+                }
+                ("output", "Battery current", "A") => {
+                    numeric(value).map(|v| (format!("{c}.current"), v))
+                }
+                ("output", "Bat. temperature", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.battery.temperature"), v))
+                }
+
+                ("monitoring", "State", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.deviceMode"), v))
+                }
+                ("monitoring", "State of charger", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.chargingMode"), v)),
+                ("monitoring", "Charger", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.state"), v))
+                }
+                ("monitoring", "Set max current", "A") => {
+                    numeric(value).map(|v| (format!("{c}.currentLimit"), v))
+                }
+                ("monitoring", "Output 1", "V") => {
+                    numeric(value).map(|v| (format!("{c}.voltage"), v))
+                }
+                ("monitoring", "Output 1", "A") => {
+                    numeric(value).map(|v| (format!("{c}.current"), v))
+                }
+                ("monitoring", "Output 2", "V") => {
+                    numeric(value).map(|v| (format!("{c}.output2.voltage"), v))
+                }
+                ("monitoring", "Output 2", "A") => {
+                    numeric(value).map(|v| (format!("{c}.output2.current"), v))
+                }
+                ("monitoring", "Output 3", "V") => {
+                    numeric(value).map(|v| (format!("{c}.output3.voltage"), v))
+                }
+                ("monitoring", "Output 3", "A") => {
+                    numeric(value).map(|v| (format!("{c}.output3.current"), v))
+                }
+                ("monitoring", "Battery", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.battery.temperature"), v))
+                }
+
+                _ => None,
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // APR — Alpha Pro alternator regulator.
+        // Group-aware handling preserves the regulator's battery and shunt views
+        // separately instead of coalescing same-named fields.
+        // ---------------------------------------------------------------------
+        "APR" => {
+            let a = format!("electrical.alternators.{id}");
+            match (group, name, unit) {
+                ("general", "Device state", _) => {
+                    bool_or_label(value).map(|v| (format!("{a}.deviceState"), v))
+                }
+                ("general", "Charger state", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{a}.chargingMode"), v)),
+
+                ("battery", "Battery voltage", "V") => {
+                    numeric(value).map(|v| (format!("{a}.battery.voltage"), v))
+                }
+                ("battery", "Battery temp.", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{a}.battery.temperature"), v))
+                }
+
+                ("alternator", "Alternator volt.", "V") => {
+                    numeric(value).map(|v| (format!("{a}.voltage"), v))
+                }
+                ("alternator", "Sense voltage", "V") => {
+                    numeric(value).map(|v| (format!("{a}.voltageSense"), v))
+                }
+                ("alternator", "Field current", "A") => {
+                    numeric(value).map(|v| (format!("{a}.field.current"), v))
+                }
+                ("alternator", "Alternator temp.", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{a}.temperature"), v))
+                }
+                ("alternator", "Alternator shaft", "rpm") => {
+                    rpm_to_hz(value).map(|v| (format!("{a}.revolutions"), v))
+                }
+                ("alternator", "Engine shaft", "rpm") => {
+                    rpm_to_hz(value).map(|v| (format!("{a}.engine.revolutions"), v))
+                }
+
+                ("shunt", "State", _) => {
+                    bool_or_label(value).map(|v| (format!("{a}.shunt.state"), v))
+                }
+                ("shunt", "State of charge", "%") => {
+                    percent_to_ratio(value).map(|v| (format!("{a}.shunt.stateOfCharge"), v))
+                }
+                ("shunt", "Battery voltage", "V") => {
+                    numeric(value).map(|v| (format!("{a}.shunt.voltage"), v))
+                }
+                ("shunt", "Battery current", "A") => {
+                    numeric(value).map(|v| (format!("{a}.shunt.current"), v))
+                }
+                ("shunt", "Battery temp.", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{a}.shunt.temperature"), v))
+                }
+
+                // Compatibility fallback for APR schemas without useful group names.
+                (_, "Alternator volt.", "V") => numeric(value).map(|v| (format!("{a}.voltage"), v)),
+                (_, "Sense voltage", "V") => {
+                    numeric(value).map(|v| (format!("{a}.voltageSense"), v))
+                }
+                (_, "Field current", "A") => {
+                    numeric(value).map(|v| (format!("{a}.field.current"), v))
+                }
+                (_, "Alternator temp.", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{a}.temperature"), v))
+                }
+                (_, "Alternator shaft", "rpm") => {
+                    rpm_to_hz(value).map(|v| (format!("{a}.revolutions"), v))
+                }
+                (_, "Engine shaft", "rpm") => {
+                    rpm_to_hz(value).map(|v| (format!("{a}.engine.revolutions"), v))
+                }
+                (_, "Charger state", _) => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{a}.chargingMode"), v)),
+                (_, "State of charge", "%") => {
+                    percent_to_ratio(value).map(|v| (format!("{a}.battery.stateOfCharge"), v))
+                }
+                (_, "Battery voltage", "V") => {
+                    numeric(value).map(|v| (format!("{a}.battery.voltage"), v))
+                }
+                (_, "Battery current", "A") => {
+                    numeric(value).map(|v| (format!("{a}.battery.current"), v))
+                }
+                (_, "Battery temp.", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{a}.battery.temperature"), v))
+                }
+
+                _ => None,
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // DIS — EasyView display.
+        //
+        // Switch labels are user-created on the display, so they are intentionally
+        // wildcarded: every non-empty discovered field in the `switches` group is
+        // published using a sanitized form of its actual label.
+        // ---------------------------------------------------------------------
+        "DIS" => {
+            let b = format!("electrical.masterbus.{id}");
+            match group {
+                "switches" => {
+                    let slug = field_slug(name);
+                    if slug.is_empty() {
+                        None
+                    } else {
+                        text_value(value).map(|v| (format!("{b}.switches.{slug}.state"), v))
+                    }
+                }
+
+                "general" => match name {
+                    "Language" => text_value(value).map(|v| (format!("{b}.display.language"), v)),
+                    "Alarm sound" => {
+                        bool_or_label(value).map(|v| (format!("{b}.display.alarmSound"), v))
+                    }
+                    _ => None,
+                },
+
+                "power-save" => match (name, unit) {
+                    ("Standby time", _) => seconds_value(value)
+                        .map(serde_json::Value::from)
+                        .or_else(|| text_value(value))
+                        .map(|v| (format!("{b}.display.powerSave.standbyTime"), v)),
+                    ("Auto off", _) => {
+                        bool_or_label(value).map(|v| (format!("{b}.display.powerSave.autoOff"), v))
+                    }
+                    ("Backlight", "%") => percent_to_ratio(value)
+                        .map(|v| (format!("{b}.display.powerSave.backlight"), v)),
+                    _ => None,
+                },
+
+                "widgets" => match name {
+                    "Page duration" => seconds_value(value)
+                        .map(serde_json::Value::from)
+                        .or_else(|| text_value(value))
+                        .map(|v| (format!("{b}.display.widgets.pageDuration"), v)),
+                    "Slideshow" => {
+                        bool_or_label(value).map(|v| (format!("{b}.display.widgets.slideshow"), v))
+                    }
+                    _ => None,
+                },
+
+                _ => None,
+            }
+        }
+
         _ => None,
-    }
+    };
+
+    mapped
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `map_field` for a float monitoring value.
-    fn f(class: &str, name: &str, unit: &str, v: f32) -> Option<(String, serde_json::Value)> {
-        map_field(class, "1", "", name, unit, &Value::Float(v))
+    fn f(
+        class: &str,
+        group: &str,
+        name: &str,
+        unit: &str,
+        v: f32,
+    ) -> Option<(String, serde_json::Value)> {
+        map_field(class, "1", group, name, unit, &Value::Float(v))
     }
 
-    /// The path `map_field` produced, for assertions that only care about routing.
     fn path(r: Option<(String, serde_json::Value)>) -> Option<String> {
         r.map(|(p, _)| p)
     }
 
-    /// The MAC schema reports an empty unit on several monitoring fields; they
-    /// must still map, onto the same paths as when the unit is present.
     #[test]
-    fn mac_maps_fields_with_a_missing_unit() {
-        for (name, unit) in [
-            ("Output voltage", "V"),
-            ("Output current", "A"),
-            ("Input current", "A"),
-            ("Bat. volt sense", "V"),
-        ] {
-            assert_eq!(
-                path(f("MAC", name, unit, 1.0)),
-                path(f("MAC", name, "", 1.0)),
-                "{name}"
-            );
-            assert!(
-                path(f("MAC", name, "", 1.0)).is_some(),
-                "{name} dropped with an empty unit"
-            );
-        }
-    }
-
-    /// The MAC output is the battery side, and lands on the canonical Signal K
-    /// charger leaves — not on nested `output.*` / `device.*` ones the server
-    /// has no metadata for.
-    #[test]
-    fn mac_publishes_canonical_charger_paths() {
+    fn easyview_switch_uses_discovered_label() {
+        let on = Value::Boolean(true);
         assert_eq!(
-            path(f("MAC", "Output voltage", "", 27.4)).as_deref(),
-            Some("electrical.chargers.1.voltage")
-        );
-        assert_eq!(
-            path(f("MAC", "Output current", "", 42.0)).as_deref(),
-            Some("electrical.chargers.1.current")
-        );
-        assert_eq!(
-            path(f("MAC", "Device", "\u{b0}C", 20.0)).as_deref(),
-            Some("electrical.chargers.1.temperature")
-        );
-    }
-
-    /// Relaxing the unit match must not leak to the temperature fields: "Device"
-    /// and "Battery" are generic names that only °C tells apart, so a same-named
-    /// field in another unit must not be published as a kelvin temperature.
-    #[test]
-    fn mac_temperatures_still_require_degrees_celsius() {
-        assert_eq!(f("MAC", "Device", "", 20.0), None);
-        assert_eq!(f("MAC", "Battery", "V", 12.8), None);
-        assert_eq!(f("MAC", "Battery", "A", 3.0), None);
-    }
-
-    /// Celsius → kelvin on the way out.
-    #[test]
-    fn mac_temperature_is_converted_to_kelvin() {
-        let (_, v) = f("MAC", "Battery", "\u{b0}C", 25.0).unwrap();
-        assert_eq!(v.as_f64().unwrap(), 298.15);
-    }
-
-    /// "Standby" is the inverse of Signal K's `enabled`.
-    #[test]
-    fn mac_standby_inverts_into_enabled() {
-        let on = map_field("MAC", "1", "", "Standby", "", &Value::Boolean(false));
-        assert_eq!(
-            on,
+            map_field("DIS", "easyview-5", "switches", "Fwd DC/DC", "", &on),
             Some((
-                "electrical.chargers.1.enabled".into(),
+                "electrical.masterbus.easyview-5.switches.fwd-dc-dc.state".into(),
                 serde_json::Value::Bool(true)
             ))
         );
-        let off = map_field("MAC", "1", "", "Standby", "", &Value::Boolean(true));
+    }
+
+    #[test]
+    fn easyview_empty_switch_is_ignored() {
         assert_eq!(
-            off,
-            Some((
-                "electrical.chargers.1.enabled".into(),
-                serde_json::Value::Bool(false)
-            ))
+            map_field(
+                "DIS",
+                "easyview-5",
+                "switches",
+                "",
+                "",
+                &Value::Boolean(true)
+            ),
+            None
         );
     }
 
-    /// Enum fields publish their lowercased label.
     #[test]
-    fn mac_enum_states_publish_their_label() {
-        let list = |i: i32| Value::List {
-            index: i,
-            options: vec!["Off".into(), "Bulk".into()],
-        };
+    fn battery_group_and_cluster_do_not_collide() {
         assert_eq!(
-            map_field("MAC", "1", "", "Charge state", "", &list(1)),
-            Some((
-                "electrical.chargers.1.chargingMode".into(),
-                serde_json::Value::String("bulk".into())
-            ))
-        );
-        assert_eq!(
-            path(map_field("MAC", "1", "", "Device state", "", &list(0))).as_deref(),
-            Some("electrical.chargers.1.deviceMode")
-        );
-    }
-
-    /// The other classes keep the strict (name, unit) match — BAT reports three
-    /// different quantities all named "Battery", told apart only by their unit.
-    #[test]
-    fn other_classes_still_disambiguate_on_unit() {
-        assert_eq!(
-            path(f("BAT", "Battery", "V", 12.8)).as_deref(),
+            path(f("BAT", "battery", "Voltage", "V", 26.4)).as_deref(),
             Some("electrical.batteries.1.voltage")
         );
         assert_eq!(
-            path(f("BAT", "Battery", "A", -5.0)).as_deref(),
-            Some("electrical.batteries.1.current")
+            path(f("BAT", "cluster", "Voltage", "V", 26.4)).as_deref(),
+            Some("electrical.masterbus.1.cluster.voltage")
         );
-        assert_eq!(
-            path(f("BAT", "Battery", "\u{b0}C", 20.0)).as_deref(),
-            Some("electrical.batteries.1.temperature")
-        );
-        assert_eq!(f("BAT", "Battery", "", 12.8), None);
     }
 
-    /// Every leaf MAC publishes a number on must carry unit metadata, or Signal
-    /// K cannot unit-convert it.
     #[test]
-    fn mac_numeric_leaves_have_unit_metadata() {
-        for (name, unit) in [
-            ("Output voltage", ""),
-            ("Output current", ""),
-            ("Input voltage", "V"),
-            ("Input current", ""),
-            ("Bat. volt sense", ""),
-            ("Device", "\u{b0}C"),
-            ("Battery", "\u{b0}C"),
+    fn mcu_same_label_is_disambiguated_by_group() {
+        assert_eq!(
+            path(f("MCU", "cluster-ac-in", "Mains", "V", 230.0)).as_deref(),
+            Some("electrical.masterbus.1.cluster.acInMains.voltage")
+        );
+        assert_eq!(
+            path(f("MCU", "ac-inputs", "Mains", "V", 230.0)).as_deref(),
+            Some("electrical.masterbus.1.acInputs.mains.voltage")
+        );
+    }
+
+    #[test]
+    fn apr_shunt_and_battery_views_remain_distinct() {
+        assert_eq!(
+            path(f("APR", "battery", "Battery voltage", "V", 27.0)).as_deref(),
+            Some("electrical.alternators.1.battery.voltage")
+        );
+        assert_eq!(
+            path(f("APR", "shunt", "Battery voltage", "V", 27.0)).as_deref(),
+            Some("electrical.alternators.1.shunt.voltage")
+        );
+    }
+
+    #[test]
+    fn mac_missing_unit_compatibility_is_retained() {
+        assert_eq!(
+            path(f("MAC", "", "Output voltage", "", 27.4)).as_deref(),
+            Some("electrical.chargers.1.voltage")
+        );
+        assert_eq!(
+            path(f("MAC", "", "Output current", "", 42.0)).as_deref(),
+            Some("electrical.chargers.1.current")
+        );
+    }
+
+    #[test]
+    fn temperature_is_converted_to_kelvin() {
+        let (_, v) = f("MAC", "temperature", "Battery", "°C", 25.0).unwrap();
+        assert!((v.as_f64().unwrap() - 298.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rpm_is_converted_to_hz() {
+        let (_, v) = f("APR", "alternator", "Alternator shaft", "rpm", 1800.0).unwrap();
+        assert_eq!(v.as_f64().unwrap(), 30.0);
+    }
+
+    #[test]
+    fn known_numeric_paths_have_unit_metadata() {
+        for p in [
+            "electrical.batteries.house.voltage",
+            "electrical.masterbus.combi.acInputs.mains.current",
+            "electrical.masterbus.combi.solarInput.power",
+            "electrical.alternators.alt-110a.field.current",
+            "electrical.chargers.fwd-charger.currentLimit",
         ] {
-            let p = path(f("MAC", name, unit, 1.0)).unwrap();
-            assert!(sk_units(&p).is_some(), "{p} has no unit metadata");
+            assert!(sk_units(p).is_some(), "{p} has no unit metadata");
         }
     }
 }
