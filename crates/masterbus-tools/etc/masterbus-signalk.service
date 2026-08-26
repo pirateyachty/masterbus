@@ -1,27 +1,23 @@
 # systemd unit for the MasterBus -> Signal K bridge.
 #
 # Install:
-#   sudo cp target/<triple>/release/masterbus-signalk /usr/local/bin/
+#   sudo cp masterbus-signalk /usr/local/bin/
 #   sudo cp masterbus-signalk.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now masterbus-signalk
 #
-# Transport + master role come from /etc/default/masterbus/config.ini
-# (auto-created on first run with detected defaults; review and edit as
-# needed — see `masterbus::FileConfig` for the format).
+# MasterBus transport configuration:
+#   /etc/default/masterbus/config.ini
 #
-# /etc/default/masterbus-signalk/ optionally holds:
-#   config       environment overrides (e.g. LISTEN); read by systemd.
-#   mapping.ini  per-device publish toggles; the service auto-creates and updates
-#                it as devices are discovered. Edit the true/false flags while the
-#                service is stopped, then restart.
+# Signal K field configuration:
+#   /etc/default/masterbus-signalk/masterbus-signalk-fields.toml
 #
-# Then add a Signal K data connection of type "Signal K" over TCP pointing at
-# this host on the LISTEN port (default 3009).
+# Default TCP listen address:
+#   0.0.0.0:3009
 
 [Unit]
 Description=Mastervolt MasterBus to Signal K bridge
-Documentation=https://github.com/keesverruijt/masterbus
+Documentation=https://github.com/pirateyachty/masterbus
 After=network-online.target
 Wants=network-online.target
 
@@ -29,40 +25,16 @@ Wants=network-online.target
 Type=exec
 SyslogIdentifier=masterbus-signalk
 
-# Default listen address; override in /etc/default/masterbus-signalk/config.
 Environment=LISTEN=0.0.0.0:3009
-Environment=MAPPING=/etc/default/masterbus-signalk/mapping.ini
 EnvironmentFile=-/etc/default/masterbus-signalk/config
+
+WorkingDirectory=/etc/default/masterbus-signalk
 ExecStart=/usr/local/bin/masterbus-signalk ${LISTEN}
 
 Restart=on-failure
 RestartSec=5
 
-# Persistent schema cache in /var/lib/masterbus (created and owned automatically;
-# the path is read from /etc/default/masterbus/config.ini's `cache_dir` key,
-# which defaults to /var/lib/masterbus on first run).
 StateDirectory=masterbus
-
-# Hardening. The service auto-rewrites mapping.ini in /etc, which a DynamicUser
-# sandbox can't own, so it runs as root but is tightly confined: the only
-# writable paths are the config dirs and the state dir, the only capability is
-# CAP_NET_RAW (for SocketCAN), and the syscall/address-family surface is limited.
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=/etc/default/masterbus-signalk /etc/default/masterbus
-ProtectHome=yes
-PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_CAN
-RestrictNamespaces=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

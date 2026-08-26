@@ -171,22 +171,60 @@ to publish; when it resumes sending, its configured fields can resume normally.
 
 ### Run as a systemd service
 
-A hardened unit is included at
-[`etc/masterbus-signalk.service`](etc/masterbus-signalk.service):
+A systemd unit is included at
+[`etc/masterbus-signalk.service`](etc/masterbus-signalk.service).
+
+Install the binary and service:
 
 ```sh
-sudo cp $(which masterbus-signalk) /usr/local/bin/             # already there if installed via cargo install
+sudo cp masterbus-signalk /usr/local/bin/
 sudo cp etc/masterbus-signalk.service /etc/systemd/system/
-# First run as root creates /etc/default/masterbus/config.ini with
-# auto-detected transport + master settings; review/edit it as needed.
+sudo mkdir -p /etc/default/masterbus-signalk
+sudo systemctl daemon-reload
+```
+
+MasterBus transport configuration is stored at:
+
+```text
+/etc/default/masterbus/config.ini
+```
+
+The service uses `/etc/default/masterbus-signalk/` as its working directory, so
+its field publication configuration is stored at:
+
+```text
+/etc/default/masterbus-signalk/masterbus-signalk-fields.toml
+```
+
+On first discovery, `masterbus-signalk` creates or updates that TOML. Newly
+discovered fields remain disabled until explicitly enabled.
+
+The default TCP listen address is `0.0.0.0:3009`. To override it, create:
+
+```text
+/etc/default/masterbus-signalk/config
+```
+
+with, for example:
+
+```sh
+LISTEN=0.0.0.0:4000
+```
+
+The persistent MasterBus schema cache is kept in `/var/lib/masterbus`.
+
+After reviewing the MasterBus transport configuration and enabling the desired
+Signal K fields, start the service:
+
+```sh
 sudo systemctl enable --now masterbus-signalk
 ```
 
-Transport, master role, and the schema-cache directory are configured in
-`/etc/default/masterbus/config.ini` (auto-created on first run; see the
-**Configuration** section above) and the systemd unit's `LISTEN` env var. The
-service keeps a persistent schema cache in `/var/lib/masterbus` and restarts on
-failure.
+Logs can be viewed with:
+
+```sh
+journalctl -u masterbus-signalk -f
+```
 
 ## `masterbus-set-field`
 

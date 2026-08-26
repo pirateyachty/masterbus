@@ -90,6 +90,19 @@ startup can be discovered without requiring a restart.
 
 After enabling fields, restart `masterbus-signalk` so it reloads the TOML.
 
+When running manually, the TOML lives in the directory from which
+`masterbus-signalk` was started.
+
+When installed with the supplied systemd service, the standard locations are:
+
+```text
+/etc/default/masterbus/config.ini
+/etc/default/masterbus-signalk/masterbus-signalk-fields.toml
+```
+
+The systemd service listens on `0.0.0.0:3009` by default and keeps the persistent
+MasterBus schema cache in `/var/lib/masterbus`.
+
 Then `nc localhost 3009` shows the live stream. Any language that can read a TCP
 socket and parse JSON can consume this — Python, Node, shell, anything. Despite
 the name it works fine without a Signal K server: it's just JSON lines.

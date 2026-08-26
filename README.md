@@ -198,7 +198,26 @@ normally.
 `masterbus-signalk-fields.toml` is installation-specific runtime configuration
 and is intentionally excluded from Git.
 
-Ships with a hardened systemd unit.
+For interactive use, `masterbus-signalk-fields.toml` is created in the current
+working directory.
+
+For a systemd installation, the supplied unit uses
+`/etc/default/masterbus-signalk/` as its working directory, so the field
+configuration is stored at:
+
+    /etc/default/masterbus-signalk/masterbus-signalk-fields.toml
+
+MasterBus transport configuration is stored separately at:
+
+    /etc/default/masterbus/config.ini
+
+The service listens on `0.0.0.0:3009` by default. The listen address can be
+overridden with `LISTEN` in:
+
+    /etc/default/masterbus-signalk/config
+
+The service binary is installed at `/usr/local/bin/masterbus-signalk` and the
+persistent MasterBus schema cache is kept in `/var/lib/masterbus`.
 
 ### C library and demos
 
