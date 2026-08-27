@@ -1,0 +1,41 @@
+# systemd unit for the MasterBus Signal K configuration web editor.
+#
+# Web UI:
+#   http://<appliance>:3010
+#
+# Edits:
+#   /etc/default/masterbus-signalk/masterbus-signalk-fields.toml
+#
+# The service intentionally runs with the same system-level authority as
+# masterbus-signalk because "Save & Restart" must atomically update that file
+# and restart the bridge. It exposes no shell/command parameter API.
+
+[Unit]
+Description=MasterBus Signal K configuration web editor
+Documentation=https://github.com/pirateyachty/masterbus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+SyslogIdentifier=masterbus-config-web
+Environment=MASTERBUS_CONFIG_WEB_LISTEN=0.0.0.0:3010
+Environment=MASTERBUS_SIGNALK_FIELDS=/etc/default/masterbus-signalk/masterbus-signalk-fields.toml
+EnvironmentFile=-/etc/default/masterbus-config-web/config
+
+ExecStart=/usr/local/bin/masterbus-config-web
+
+Restart=on-failure
+RestartSec=5
+
+# Basic service hardening. The editor still needs to write its one config
+# directory and invoke systemctl to restart masterbus-signalk.
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+
+[Install]
+WantedBy=multi-user.target

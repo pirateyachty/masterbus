@@ -30,7 +30,7 @@ jobs:
         with:
           key: appliance-aarch64
 
-      - name: Build masterbus-signalk
+      - name: Build appliance binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
@@ -38,6 +38,7 @@ jobs:
             --release \
             -p masterbus-tools \
             --bin masterbus-signalk \
+            --bin masterbus-config-web \
             --target aarch64-unknown-linux-gnu
 
       - name: Package
@@ -49,14 +50,25 @@ jobs:
           mkdir -p "$DIST"
 
           cp "$OUT/masterbus-signalk" "$DIST/"
+          cp "$OUT/masterbus-config-web" "$DIST/"
           cp crates/masterbus-tools/etc/masterbus-signalk.service "$DIST/"
+          cp crates/masterbus-tools/etc/masterbus-config-web.service "$DIST/"
 
           cat > "$DIST/README.txt" <<'EOF'
-          masterbus-signalk runtime package
+          MasterBus Signal K appliance runtime package
+
+          Included:
+            - masterbus-signalk
+            - masterbus-config-web
+            - masterbus-signalk.service
+            - masterbus-config-web.service
 
           Host-local files are intentionally NOT included:
             - masterbus-signalk-fields.toml
             - MasterBus config.ini
+
+          Web configuration UI defaults to TCP port 3010.
+          Keep host-local configuration files when upgrading.
           EOF
 
           tar czf "$DIST.tar.gz" "$DIST"
