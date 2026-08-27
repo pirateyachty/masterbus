@@ -39,7 +39,7 @@ use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use masterbus::{Config, DeviceEvent, DeviceId, FieldId, MasterBus, Menu};
 use serde::{Deserialize, Serialize};
@@ -53,8 +53,16 @@ use mapping::{map_field, sk_bases, sk_units, suggested_path};
 /// Default TCP listen address.
 const DEFAULT_LISTEN: &str = "0.0.0.0:3009";
 
-/// How often each value is (re)emitted.
+/// How often each enabled MasterBus field is requested.
 const RATE: Duration = Duration::from_millis(1000);
+
+/// How long an enabled dynamic Signal K path may go without a fresh value
+/// before its last published value is invalidated with `null`.
+///
+/// A complete pass over all enabled fields can take several seconds on a busy
+/// MasterBus even though RATE is 1 s, so this intentionally allows roughly a
+/// couple of observed passes before declaring an individual field stale.
+const FIELD_STALE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default field-level publication configuration.
 const DEFAULT_FIELDS_CONFIG: &str = "masterbus-signalk-fields.toml";
@@ -573,6 +581,18 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
         subs.push(bus.subscribe(device, indices, RATE, false));
     }
 
+    // Track freshness per enabled dynamic Signal K path. Static identity metadata
+    // is not represented in `meta`, so it is never subject to stale clearing.
+    // Start each enabled path's grace window now; this also guarantees that a
+    // field which never produces a value (for example an inactive AC input) will
+    // be explicitly nulled instead of allowing an older Signal K value to linger.
+    let freshness_started = Instant::now();
+    let mut field_last_seen: HashMap<String, Instant> = meta
+        .values()
+        .map(|m| (m.path.clone(), freshness_started))
+        .collect();
+    let mut stale_paths: HashSet<String> = HashSet::new();
+
     // Render the static metadata batch and hand it to the accept thread (for
     // future clients) and to any client already connected during discovery.
     let sb = static_meta_batch(&device_metas, &published, &field_config);
@@ -606,13 +626,20 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
             // values rapidly, and we emit those too).
             let mut latest: HashMap<String, serde_json::Value> = HashMap::new();
             while let Some(u) = sub.try_recv() {
-                if have_clients
-                    && let Some(m) = meta.get(&(u.device, u.field))
+                if let Some(m) = meta.get(&(u.device, u.field))
                     && let Some((path, value)) =
                         map_field(&m.class, &m.instance, &m.group, &m.name, &m.unit, &u.value)
                 {
                     let _ = path; // conversion path; publication path is user-configurable.
-                    latest.insert(m.path.clone(), value);
+
+                    // Freshness is tracked even when no TCP client is connected, so
+                    // a later client gets an accurate stale/fresh decision immediately.
+                    field_last_seen.insert(m.path.clone(), Instant::now());
+                    stale_paths.remove(&m.path);
+
+                    if have_clients {
+                        latest.insert(m.path.clone(), value);
+                    }
                 }
             }
             if !latest.is_empty() {
@@ -662,16 +689,143 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
             }
         }
 
-        // Device presence is event-driven in the MasterBus runtime. Only an Alive
-        // event for an ID that was absent from the initial discovery causes schema
-        // enumeration here. Offline events deliberately do nothing: configuration
-        // and subscriptions persist, so an initially known device can simply resume
-        // producing updates when it broadcasts again.
+        // Per-field freshness: a device may remain online while one of its enabled
+        // values stops updating (for example an MCU stays alive after generator AC
+        // disappears). Invalidate only those stale dynamic paths. A path is emitted
+        // as null once per stale episode and becomes eligible again after any fresh
+        // update arrives.
+        if have_clients {
+            let now = Instant::now();
+            let mut newly_stale: Vec<String> = field_last_seen
+                .iter()
+                .filter(|(path, last_seen)| {
+                    now.duration_since(**last_seen) > FIELD_STALE_TIMEOUT
+                        && !stale_paths.contains(*path)
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            newly_stale.sort();
+
+            if !newly_stale.is_empty() {
+                for path in &newly_stale {
+                    stale_paths.insert(path.clone());
+                }
+                eprintln!(
+                    "masterbus-signalk: {} field(s) stale after {:?}; clearing published values",
+                    newly_stale.len(),
+                    FIELD_STALE_TIMEOUT
+                );
+                let values: Vec<_> = newly_stale
+                    .into_iter()
+                    .map(|path| json!({ "path": path, "value": serde_json::Value::Null }))
+                    .collect();
+                let delta = json!({
+                    "updates": [{
+                        "$source": "masterbus",
+                        "timestamp": now_rfc3339(),
+                        "values": values,
+                    }]
+                });
+                let mut line = serde_json::to_string(&delta).unwrap().into_bytes();
+                line.push(b'\n');
+                let mut cs = clients.lock().unwrap();
+                cs.retain_mut(|c| c.write_all(&line).and_then(|()| c.flush()).is_ok());
+            }
+        } else {
+            // Force a fresh stale-state announcement when a client next connects.
+            // Fresh fields will be removed from this set as their subscription
+            // updates are drained before the stale sweep.
+            stale_paths.clear();
+        }
+
+        // Device presence is event-driven in the MasterBus runtime. The runtime
+        // emits Offline after its configured liveness window (5 s by default).
+        // Keep subscriptions/configuration intact across an offline transition,
+        // but explicitly invalidate the device's Signal K values so consumers do
+        // not mistake the last received value for current telemetry.
         while let Ok(event) = device_events.try_recv() {
-            let DeviceEvent::Alive(id) = event else {
-                continue;
+            let id = match event {
+                DeviceEvent::Offline(id) => {
+                    let mut values = Vec::new();
+
+                    // Null only enabled subscribed/operational values owned by this device.
+                    // Static identity metadata (name, manufacturer.name, manufacturer.model)
+                    // is emitted separately by static_meta_batch() and is intentionally preserved
+                    // while the device is offline. MasterBus itself decides device liveness.
+                    let mut paths: Vec<String> = meta
+                        .iter()
+                        .filter(|((device, _), _)| *device == id)
+                        .map(|(_, m)| m.path.clone())
+                        .collect();
+                    paths.sort();
+                    paths.dedup();
+                    for path in paths {
+                        stale_paths.insert(path.clone());
+                        values.push(json!({ "path": path, "value": serde_json::Value::Null }));
+                    }
+
+                    // Publish an explicit availability flag at every effective base
+                    // used by the device's enabled fields.
+                    if let Some(d) = device_metas.iter().find(|d| d.device == id) {
+                        let mut bases: Vec<String> = effective_bases_for_device(d, &field_config)
+                            .into_iter()
+                            .collect();
+                        bases.sort();
+                        for base in bases {
+                            values
+                                .push(json!({ "path": format!("{base}.online"), "value": false }));
+                        }
+                    }
+
+                    if !values.is_empty() {
+                        eprintln!(
+                            "masterbus-signalk: device 0x{id:06X} offline; clearing published values"
+                        );
+                        let delta = json!({
+                            "updates": [{
+                                "$source": "masterbus",
+                                "timestamp": now_rfc3339(),
+                                "values": values,
+                            }]
+                        });
+                        let mut line = serde_json::to_string(&delta).unwrap().into_bytes();
+                        line.push(b'\n');
+                        let mut cs = clients.lock().unwrap();
+                        cs.retain_mut(|c| c.write_all(&line).and_then(|()| c.flush()).is_ok());
+                    }
+                    continue;
+                }
+                DeviceEvent::Alive(id) => id,
             };
+
+            // An Alive event is also the recovery signal for a previously offline
+            // device. Publish availability immediately; normal subscriptions will
+            // repopulate its values as fresh updates arrive.
             if known_devices.contains(&id) {
+                if let Some(d) = device_metas.iter().find(|d| d.device == id) {
+                    let mut bases: Vec<String> = effective_bases_for_device(d, &field_config)
+                        .into_iter()
+                        .collect();
+                    bases.sort();
+                    if !bases.is_empty() {
+                        let values: Vec<_> = bases
+                            .into_iter()
+                            .map(|base| json!({ "path": format!("{base}.online"), "value": true }))
+                            .collect();
+                        eprintln!("masterbus-signalk: device 0x{id:06X} online");
+                        let delta = json!({
+                            "updates": [{
+                                "$source": "masterbus",
+                                "timestamp": now_rfc3339(),
+                                "values": values,
+                            }]
+                        });
+                        let mut line = serde_json::to_string(&delta).unwrap().into_bytes();
+                        line.push(b'\n');
+                        let mut cs = clients.lock().unwrap();
+                        cs.retain_mut(|c| c.write_all(&line).and_then(|()| c.flush()).is_ok());
+                    }
+                }
                 continue;
             }
 
@@ -751,6 +905,8 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
                         path: cfg.path.clone(),
                     },
                 );
+                field_last_seen.insert(cfg.path.clone(), Instant::now());
+                stale_paths.remove(&cfg.path);
                 indices.push(f.index);
             }
 
@@ -769,6 +925,31 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
             if !sb.is_empty() {
                 let mut cs = clients.lock().unwrap();
                 cs.retain_mut(|c| c.write_all(&sb).and_then(|()| c.flush()).is_ok());
+            }
+
+            // This event itself proves the newly discovered device is online.
+            if let Some(d) = device_metas.iter().find(|d| d.device == id) {
+                let mut bases: Vec<String> = effective_bases_for_device(d, &field_config)
+                    .into_iter()
+                    .collect();
+                bases.sort();
+                if !bases.is_empty() {
+                    let values: Vec<_> = bases
+                        .into_iter()
+                        .map(|base| json!({ "path": format!("{base}.online"), "value": true }))
+                        .collect();
+                    let delta = json!({
+                        "updates": [{
+                            "$source": "masterbus",
+                            "timestamp": now_rfc3339(),
+                            "values": values,
+                        }]
+                    });
+                    let mut line = serde_json::to_string(&delta).unwrap().into_bytes();
+                    line.push(b'\n');
+                    let mut cs = clients.lock().unwrap();
+                    cs.retain_mut(|c| c.write_all(&line).and_then(|()| c.flush()).is_ok());
+                }
             }
         }
 
