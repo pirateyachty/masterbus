@@ -117,8 +117,8 @@ jobs:
 
       # Small runtime-only package for masterbus-signalk.
       # This is the package intended for Pi / appliance deployments.
-      - name: Package masterbus-signalk runtime (Linux tags only)
-        if: startsWith(github.ref, 'refs/tags/') && contains(matrix.target, 'linux')
+      - name: Package masterbus-signalk runtime
+        if: (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && contains(matrix.target, 'linux')
         shell: bash
         run: |
           out="target/${{ matrix.target }}/release"
@@ -142,6 +142,15 @@ jobs:
           sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256"
 
           echo "SIGNALK_DIST=$dist" >> "$GITHUB_ENV"
+
+      - name: Upload masterbus-signalk runtime artifact
+        if: (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && contains(matrix.target, 'linux')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SIGNALK_DIST }}
+          path: |
+            ${{ env.SIGNALK_DIST }}.tar.gz
+            ${{ env.SIGNALK_DIST }}.tar.gz.sha256
 
       - name: Attach full release asset (tags only)
         if: startsWith(github.ref, 'refs/tags/')
