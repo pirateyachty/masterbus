@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
@@ -28,7 +28,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: aarch64-unknown-linux-gnu
+          key: appliance-aarch64
 
       - name: Build masterbus-signalk
         env:
@@ -40,17 +40,18 @@ jobs:
             --bin masterbus-signalk \
             --target aarch64-unknown-linux-gnu
 
-      - name: Package runtime
+      - name: Package
         run: |
-          out="target/aarch64-unknown-linux-gnu/release"
-          dist="masterbus-signalk-aarch64-unknown-linux-gnu"
+          TARGET="aarch64-unknown-linux-gnu"
+          OUT="target/$TARGET/release"
+          DIST="masterbus-signalk-$TARGET"
 
-          mkdir -p "$dist"
+          mkdir -p "$DIST"
 
-          cp "$out/masterbus-signalk" "$dist/"
-          cp crates/masterbus-tools/etc/masterbus-signalk.service "$dist/"
+          cp "$OUT/masterbus-signalk" "$DIST/"
+          cp crates/masterbus-tools/etc/masterbus-signalk.service "$DIST/"
 
-          cat > "$dist/README.txt" <<'EOF'
+          cat > "$DIST/README.txt" <<'EOF'
           masterbus-signalk runtime package
 
           Host-local files are intentionally NOT included:
@@ -58,10 +59,10 @@ jobs:
             - MasterBus config.ini
           EOF
 
-          tar czf "${dist}.tar.gz" "$dist"
-          sha256sum "${dist}.tar.gz" > "${dist}.tar.gz.sha256"
+          tar czf "$DIST.tar.gz" "$DIST"
+          sha256sum "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
 
-      - name: Upload appliance artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: masterbus-signalk-aarch64-unknown-linux-gnu
