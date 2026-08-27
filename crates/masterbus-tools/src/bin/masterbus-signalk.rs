@@ -62,7 +62,7 @@ const RATE: Duration = Duration::from_millis(1000);
 /// A complete pass over all enabled fields can take several seconds on a busy
 /// MasterBus even though RATE is 1 s, so this intentionally allows roughly a
 /// couple of observed passes before declaring an individual field stale.
-const FIELD_STALE_TIMEOUT: Duration = Duration::from_secs(10);
+const FIELD_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default field-level publication configuration.
 const DEFAULT_FIELDS_CONFIG: &str = "masterbus-signalk-fields.toml";
