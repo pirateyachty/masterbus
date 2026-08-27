@@ -245,8 +245,17 @@ fn validate_config(cfg: &PublicationConfig) -> std::io::Result<()> {
             )));
         }
 
-        validate_signalk_path(&f.path)?;
-        validate_signalk_path(&f.suggested_path)?;
+        // Disabled/unmapped fields may legitimately have no Signal K path yet.
+        // An enabled field must have a valid publication path.
+        if f.enabled || !f.path.trim().is_empty() {
+            validate_signalk_path(&f.path)?;
+        }
+
+        // suggested_path is mapper-owned guidance. Unknown/unmapped fields can
+        // legitimately have an empty suggestion.
+        if !f.suggested_path.trim().is_empty() {
+            validate_signalk_path(&f.suggested_path)?;
+        }
     }
 
     Ok(())
@@ -441,7 +450,10 @@ function setMessage(text,kind=""){
   const el=$("message"); el.textContent=text; el.className="status"+(kind?" "+kind:"");
 }
 function markDirty(){dirty=true; document.title="* MasterBus Signal K Configuration";}
-function pathValid(p){return !!p && !p.startsWith(".") && !p.endsWith(".") && !p.includes("..") && /^[A-Za-z0-9._-]+$/.test(p);}
+function pathValid(p,required=true){
+  if(!p)return !required;
+  return !p.startsWith(".") && !p.endsWith(".") && !p.includes("..") && /^[A-Za-z0-9._-]+$/.test(p);
+}
 function deviceLabel(d){return `${d.instance} · ${d.class} · ${d.device}`;}
 
 async function load(){
@@ -485,7 +497,7 @@ function render(){
     });
     head.append(left,meta); card.appendChild(head);
 
-    const body=document.createElement("div");body.className="device-body";
+    const body=document.createElement("div");body.className="device-body hidden";
     head.onclick=e=>{if(e.target.tagName!=="INPUT")body.classList.toggle("hidden")};
 
     const tw=document.createElement("div");tw.className="tablewrap";
@@ -496,13 +508,17 @@ function render(){
     fields.forEach(f=>{
       const tr=document.createElement("tr");
       const ctd=document.createElement("td"), c=document.createElement("input");c.type="checkbox";c.checked=f.enabled;
-      c.onchange=e=>{f.enabled=e.target.checked;markDirty();};ctd.appendChild(c);
+      ctd.appendChild(c);
 
       const vals=[f.group,f.field,f.unit]; const cells=vals.map(v=>{const td=document.createElement("td");td.textContent=v;return td});
-      const std=document.createElement("td");std.className="suggested";std.textContent=f.suggested_path;
+      const std=document.createElement("td");std.className="suggested";std.textContent=f.suggested_path || "—";
       const ptd=document.createElement("td"), inp=document.createElement("input");inp.type="text";inp.className="path";inp.value=f.path;
-      const updateClass=()=>{inp.classList.toggle("custom",inp.value!==f.suggested_path);inp.classList.toggle("badpath",!pathValid(inp.value));};
+      const updateClass=()=>{
+        inp.classList.toggle("custom",inp.value!==f.suggested_path);
+        inp.classList.toggle("badpath",!pathValid(inp.value,f.enabled));
+      };
       updateClass();
+      c.onchange=e=>{f.enabled=e.target.checked;updateClass();markDirty();};
       inp.oninput=e=>{f.path=e.target.value;updateClass();markDirty();};ptd.appendChild(inp);
       const rtd=document.createElement("td"), reset=document.createElement("button");reset.className="reset";reset.textContent="Reset";
       reset.onclick=()=>{f.path=f.suggested_path;inp.value=f.path;updateClass();markDirty();};rtd.appendChild(reset);
@@ -513,8 +529,8 @@ function render(){
 }
 
 async function save(restart){
-  const invalid=cfg.fields.filter(f=>!pathValid(f.path));
-  if(invalid.length){setMessage(`${invalid.length} invalid Signal K path(s). Fix highlighted rows before saving.`,"bad");return;}
+  const invalid=cfg.fields.filter(f=>!pathValid(f.path,f.enabled));
+  if(invalid.length){setMessage(`${invalid.length} enabled field(s) have an invalid Signal K path. Fix highlighted rows before saving.`,"bad");return;}
   $("save").disabled=$("saveRestart").disabled=true;
   try{
     let r=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)});
