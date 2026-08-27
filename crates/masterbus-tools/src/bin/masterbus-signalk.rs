@@ -456,9 +456,14 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
     // completes. Replayed to every client the moment it connects so late joiners
     // still learn each device's identity without waiting for a value change.
     let static_batch: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // One-shot reset of every enabled dynamic path. Replayed on every client
+    // connection before fresh values so a reconnect cannot inherit stale values
+    // from an earlier sidecar process/session.
+    let reset_batch: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let clients = clients.clone();
         let static_batch = static_batch.clone();
+        let reset_batch = reset_batch.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let _ = stream.set_nodelay(true);
@@ -470,6 +475,10 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
                 let sb = static_batch.lock().unwrap().clone();
                 if !sb.is_empty() {
                     let _ = (&stream).write_all(&sb).and_then(|()| (&stream).flush());
+                }
+                let rb = reset_batch.lock().unwrap().clone();
+                if !rb.is_empty() {
+                    let _ = (&stream).write_all(&rb).and_then(|()| (&stream).flush());
                 }
                 clients.lock().unwrap().push(stream);
             }
@@ -581,17 +590,14 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
         subs.push(bus.subscribe(device, indices, RATE, false));
     }
 
-    // Track freshness per enabled dynamic Signal K path. Static identity metadata
-    // is not represented in `meta`, so it is never subject to stale clearing.
-    // Start each enabled path's grace window now; this also guarantees that a
-    // field which never produces a value (for example an inactive AC input) will
-    // be explicitly nulled instead of allowing an older Signal K value to linger.
-    let freshness_started = Instant::now();
-    let mut field_last_seen: HashMap<String, Instant> = meta
-        .values()
-        .map(|m| (m.path.clone(), freshness_started))
-        .collect();
-    let mut stale_paths: HashSet<String> = HashSet::new();
+    // Track freshness only after an enabled dynamic Signal K path has actually
+    // produced a value in this process. Static identity metadata is not represented
+    // in `meta`, so it is never subject to reset/stale clearing.
+    let mut field_last_seen: HashMap<String, Instant> = HashMap::new();
+    // Every dynamic path starts invalidated. A fresh MasterBus update removes it
+    // from this set; if that path later exceeds FIELD_STALE_TIMEOUT it is nulled
+    // once and re-enters the set until another real value arrives.
+    let mut stale_paths: HashSet<String> = meta.values().map(|m| m.path.clone()).collect();
 
     // Render the static metadata batch and hand it to the accept thread (for
     // future clients) and to any client already connected during discovery.
@@ -600,6 +606,20 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
     if !sb.is_empty() {
         let mut cs = clients.lock().unwrap();
         cs.retain_mut(|c| c.write_all(&sb).and_then(|()| c.flush()).is_ok());
+    }
+
+    // Clear every enabled dynamic path once at startup. This deliberately removes
+    // values left in Signal K by an earlier sidecar run (for example generator AC
+    // values when the generator was already off before this process started).
+    let rb = dynamic_reset_batch(&meta);
+    *reset_batch.lock().unwrap() = rb.clone();
+    if !rb.is_empty() {
+        eprintln!(
+            "masterbus-signalk: resetting {} enabled dynamic path(s) before fresh streaming",
+            stale_paths.len()
+        );
+        let mut cs = clients.lock().unwrap();
+        cs.retain_mut(|c| c.write_all(&rb).and_then(|()| c.flush()).is_ok());
     }
 
     eprintln!(
@@ -731,11 +751,6 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
                 let mut cs = clients.lock().unwrap();
                 cs.retain_mut(|c| c.write_all(&line).and_then(|()| c.flush()).is_ok());
             }
-        } else {
-            // Force a fresh stale-state announcement when a client next connects.
-            // Fresh fields will be removed from this set as their subscription
-            // updates are drained before the stale sweep.
-            stale_paths.clear();
         }
 
         // Device presence is event-driven in the MasterBus runtime. The runtime
@@ -760,6 +775,7 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
                     paths.sort();
                     paths.dedup();
                     for path in paths {
+                        field_last_seen.remove(&path);
                         stale_paths.insert(path.clone());
                         values.push(json!({ "path": path, "value": serde_json::Value::Null }));
                     }
@@ -905,8 +921,10 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
                         path: cfg.path.clone(),
                     },
                 );
-                field_last_seen.insert(cfg.path.clone(), Instant::now());
-                stale_paths.remove(&cfg.path);
+                // Newly discovered dynamic paths start invalidated and do not
+                // begin a freshness timer until their first real value arrives.
+                field_last_seen.remove(&cfg.path);
+                stale_paths.insert(cfg.path.clone());
                 indices.push(f.index);
             }
 
@@ -925,6 +943,33 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
             if !sb.is_empty() {
                 let mut cs = clients.lock().unwrap();
                 cs.retain_mut(|c| c.write_all(&sb).and_then(|()| c.flush()).is_ok());
+            }
+
+            // Refresh the per-connection dynamic reset snapshot and immediately
+            // invalidate any newly discovered enabled paths for current clients.
+            let rb = dynamic_reset_batch(&meta);
+            *reset_batch.lock().unwrap() = rb.clone();
+            let new_paths: Vec<_> = meta
+                .iter()
+                .filter(|((device, _), _)| *device == id)
+                .map(|(_, m)| m.path.clone())
+                .collect();
+            if !new_paths.is_empty() {
+                let values: Vec<_> = new_paths
+                    .into_iter()
+                    .map(|path| json!({ "path": path, "value": serde_json::Value::Null }))
+                    .collect();
+                let delta = json!({
+                    "updates": [{
+                        "$source": "masterbus",
+                        "timestamp": now_rfc3339(),
+                        "values": values,
+                    }]
+                });
+                let mut line = serde_json::to_string(&delta).unwrap().into_bytes();
+                line.push(b'\n');
+                let mut cs = clients.lock().unwrap();
+                cs.retain_mut(|c| c.write_all(&line).and_then(|()| c.flush()).is_ok());
             }
 
             // This event itself proves the newly discovered device is online.
@@ -1000,6 +1045,31 @@ fn effective_bases_for_device(d: &DeviceMetaRec, config: &FieldsConfig) -> HashS
     }
 
     bases
+}
+
+/// Build a one-shot reset batch for all enabled dynamic Signal K paths.
+///
+/// This is intentionally separate from static device metadata. It is replayed
+/// whenever a TCP client connects so stale operational values from an earlier
+/// sidecar process/session are cleared before fresh MasterBus values arrive.
+fn dynamic_reset_batch(meta: &HashMap<(DeviceId, FieldId), FieldMeta>) -> Vec<u8> {
+    let mut paths: Vec<String> = meta.values().map(|m| m.path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    let values: Vec<_> = paths
+        .into_iter()
+        .map(|path| json!({ "path": path, "value": serde_json::Value::Null }))
+        .collect();
+    let delta = json!({
+        "updates": [{ "$source": "masterbus", "timestamp": now_rfc3339(), "values": values }]
+    });
+    let mut batch = serde_json::to_string(&delta).unwrap().into_bytes();
+    batch.push(b'\n');
+    batch
 }
 
 /// Build the one-shot Signal K static metadata batch.
