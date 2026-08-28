@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use masterbus::{Config, DeviceEvent, DeviceId, FieldId, MasterBus, Menu, Value};
@@ -556,7 +556,8 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
                 },
             };
 
-            let mut bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
+            let mut bytes =
+                serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
             bytes.push(b'\n');
             let _ = stream.write_all(&bytes).and_then(|()| stream.flush());
         }
@@ -727,7 +728,7 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
                         .field(AFT_DC_ON_STANDBY_FIELD)
                         .set(Value::Boolean(enabled));
                     let response = match result {
-                        Ok(()) => json!({
+                        Ok(_value) => json!({
                             "ok": true,
                             "command": "aftDC",
                             "value": enabled,
