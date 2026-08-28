@@ -35,13 +35,13 @@
 //! see [`static_meta_batch`].
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use masterbus::{Config, DeviceEvent, DeviceId, FieldId, MasterBus, Menu};
+use masterbus::{Config, DeviceEvent, DeviceId, FieldId, MasterBus, Menu, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -52,6 +52,14 @@ use mapping::{map_field, sk_bases, sk_units, suggested_path};
 
 /// Default TCP listen address.
 const DEFAULT_LISTEN: &str = "0.0.0.0:3009";
+
+/// Local-only control socket. This is deliberately not exposed on the LAN.
+const CONTROL_LISTEN: &str = "127.0.0.1:3011";
+
+/// First control target: MAC Aft DC/DC -> On/Standby.
+/// Device/address and field were verified on the Trident bus with masterbus-tui.
+const AFT_DC_DEVICE: DeviceId = 0x607869;
+const AFT_DC_ON_STANDBY_FIELD: FieldId = 0x002;
 
 /// How often each enabled MasterBus field is requested.
 const RATE: Duration = Duration::from_millis(1000);
@@ -170,6 +178,21 @@ struct FieldConfig {
     suggested_path: String,
     #[serde(default)]
     path: String,
+}
+
+/// Minimal local command format for step 1 of writable support.
+/// Example: {"command":"aftDC","value":true}
+#[derive(Debug, Deserialize)]
+struct ControlRequest {
+    command: String,
+    value: bool,
+}
+
+enum ControlCommand {
+    SetAftDc {
+        enabled: bool,
+        reply: mpsc::Sender<serde_json::Value>,
+    },
 }
 
 fn device_key(device: DeviceId) -> String {
@@ -485,6 +508,60 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
         });
     }
 
+    // Local command listener. The listener thread only parses/queues requests; all
+    // MasterBus writes are executed by this run loop so monitoring and control use
+    // the same already-open MasterBus transport.
+    let control_listener = TcpListener::bind(CONTROL_LISTEN)?;
+    eprintln!(
+        "masterbus-signalk: control listening on {} (localhost only)",
+        control_listener.local_addr()?
+    );
+    let (control_tx, control_rx) = mpsc::channel::<ControlCommand>();
+    std::thread::spawn(move || {
+        for mut stream in control_listener.incoming().flatten() {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+            let mut line = String::new();
+            let read_result = {
+                let mut reader = BufReader::new(&stream);
+                reader.read_line(&mut line)
+            };
+
+            let response = match read_result {
+                Ok(0) => json!({"ok": false, "error": "empty request"}),
+                Err(e) => json!({"ok": false, "error": format!("read failed: {e}")}),
+                Ok(_) => match serde_json::from_str::<ControlRequest>(line.trim()) {
+                    Err(e) => json!({"ok": false, "error": format!("invalid JSON request: {e}")}),
+                    Ok(req) if req.command != "aftDC" => json!({
+                        "ok": false,
+                        "error": format!("unknown command {:?}; only aftDC is enabled in step 1", req.command)
+                    }),
+                    Ok(req) => {
+                        let (reply_tx, reply_rx) = mpsc::channel();
+                        if control_tx
+                            .send(ControlCommand::SetAftDc {
+                                enabled: req.value,
+                                reply: reply_tx,
+                            })
+                            .is_err()
+                        {
+                            json!({"ok": false, "error": "control loop unavailable"})
+                        } else {
+                            reply_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|e| {
+                                json!({"ok": false, "error": format!("control timeout: {e}")})
+                            })
+                        }
+                    }
+                },
+            };
+
+            let mut bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
+            bytes.push(b'\n');
+            let _ = stream.write_all(&bytes).and_then(|()| stream.flush());
+        }
+    });
+
     // Subscribe to device-presence events before the initial discovery snapshot.
     // Alive events that occur during startup remain queued and are filtered against
     // the initial known-device set once the streaming loop begins.
@@ -635,6 +712,43 @@ fn run(bus: MasterBus, listen: &str, fields_config_path: &Path) -> std::io::Resu
     let mut meta_sent: HashSet<String> = HashSet::new();
 
     loop {
+        // Handle queued local control requests on the same MasterBus connection
+        // that is already serving telemetry. Step 1 intentionally exposes only
+        // the verified Aft DC/DC On/Standby field.
+        while let Ok(command) = control_rx.try_recv() {
+            match command {
+                ControlCommand::SetAftDc { enabled, reply } => {
+                    eprintln!(
+                        "masterbus-signalk: control aftDC -> {}",
+                        if enabled { "on" } else { "standby" }
+                    );
+                    let result = bus
+                        .device(AFT_DC_DEVICE)
+                        .field(AFT_DC_ON_STANDBY_FIELD)
+                        .set(Value::Boolean(enabled));
+                    let response = match result {
+                        Ok(()) => json!({
+                            "ok": true,
+                            "command": "aftDC",
+                            "value": enabled,
+                            "device": format!("0x{AFT_DC_DEVICE:06X}"),
+                            "field": format!("0x{AFT_DC_ON_STANDBY_FIELD:03X}")
+                        }),
+                        Err(e) => {
+                            eprintln!("masterbus-signalk: control aftDC write failed: {e}");
+                            json!({
+                                "ok": false,
+                                "command": "aftDC",
+                                "value": enabled,
+                                "error": e.to_string()
+                            })
+                        }
+                    };
+                    let _ = reply.send(response);
+                }
+            }
+        }
+
         // Skip building deltas when nobody is listening (the channels are still
         // drained below so they don't grow unbounded).
         let have_clients = !clients.lock().unwrap().is_empty();
