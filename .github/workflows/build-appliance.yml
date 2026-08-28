@@ -39,6 +39,8 @@ jobs:
             -p masterbus-tools \
             --bin masterbus-signalk \
             --bin masterbus-config-web \
+            --bin masterbus-tui \
+            --bin masterbus-set-field \
             --target aarch64-unknown-linux-gnu
 
       - name: Package
@@ -51,6 +53,8 @@ jobs:
 
           cp "$OUT/masterbus-signalk" "$DIST/"
           cp "$OUT/masterbus-config-web" "$DIST/"
+          cp "$OUT/masterbus-tui" "$DIST/"
+          cp "$OUT/masterbus-set-field" "$DIST/"
           cp crates/masterbus-tools/etc/masterbus-signalk.service "$DIST/"
           cp crates/masterbus-tools/etc/masterbus-config-web.service "$DIST/"
 
@@ -60,6 +64,8 @@ jobs:
           Included:
             - masterbus-signalk
             - masterbus-config-web
+            - masterbus-tui
+            - masterbus-set-field
             - masterbus-signalk.service
             - masterbus-config-web.service
 
