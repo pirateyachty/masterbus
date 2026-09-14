@@ -23,6 +23,8 @@ ratatui = "0.30"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 masterbus = { path = "crates/masterbus", version = "0.3.4" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 
 [profile.release]
 opt-level = "z"
