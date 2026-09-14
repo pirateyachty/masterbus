@@ -518,22 +518,14 @@ pub(super) fn map_field(
                     bool_or_label(value).map(|v| (format!("{c}.state"), v))
                 }
 
-                ("dc-48v", "Thrust 48v [V]", "V") => {
-                    numeric(value).map(|v| (format!("{c}.dc48.voltage"), v))
-                }
-                ("dc-48v", "Thrust 48v [A]", "A") => {
-                    numeric(value).map(|v| (format!("{c}.dc48.current"), v))
-                }
                 ("dc-48v", "Bat. volt sense", "V") => {
                     numeric(value).map(|v| (format!("{c}.voltageSense"), v))
                 }
+                ("dc-48v", _, "V") => numeric(value).map(|v| (format!("{c}.dc48.voltage"), v)),
+                ("dc-48v", _, "A") => numeric(value).map(|v| (format!("{c}.dc48.current"), v)),
 
-                ("dc-24v", "House 24v [V]", "V") => {
-                    numeric(value).map(|v| (format!("{c}.dc24.voltage"), v))
-                }
-                ("dc-24v", "House 24v [A]", "A") => {
-                    numeric(value).map(|v| (format!("{c}.dc24.current"), v))
-                }
+                ("dc-24v", _, "V") => numeric(value).map(|v| (format!("{c}.dc24.voltage"), v)),
+                ("dc-24v", _, "A") => numeric(value).map(|v| (format!("{c}.dc24.current"), v)),
 
                 ("remote", "Remote input", _) => {
                     bool_or_label(value).map(|v| (format!("{c}.remoteInput"), v))
