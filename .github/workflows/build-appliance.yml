@@ -37,10 +37,6 @@ jobs:
           cargo build \
             --release \
             -p masterbus-tools \
-            --bin masterbus-signalk \
-            --bin masterbus-config-web \
-            --bin masterbus-tui \
-            --bin masterbus-set-field \
             --bin masterbus-dump \
             --target aarch64-unknown-linux-gnu
 
@@ -52,10 +48,6 @@ jobs:
 
           mkdir -p "$DIST"
 
-          cp "$OUT/masterbus-signalk" "$DIST/"
-          cp "$OUT/masterbus-config-web" "$DIST/"
-          cp "$OUT/masterbus-tui" "$DIST/"
-          cp "$OUT/masterbus-set-field" "$DIST/"
           cp "$OUT/masterbus-dump" "$DIST/"
           cp crates/masterbus-tools/etc/masterbus-signalk.service "$DIST/"
           cp crates/masterbus-tools/etc/masterbus-config-web.service "$DIST/"
