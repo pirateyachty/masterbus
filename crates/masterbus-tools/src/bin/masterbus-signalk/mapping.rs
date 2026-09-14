@@ -609,19 +609,26 @@ pub(super) fn map_field(
                 ("general", "Device state", _) => {
                     bool_or_label(value).map(|v| (format!("{c}.deviceMode"), v))
                 }
-                ("general", "On/Stand-by", _) => {
+                ("general", "On/Stand-by" | "On / Standby", _) => {
                     bool_or_label(value).map(|v| (format!("{c}.state"), v))
                 }
                 ("general", "Max. current", "%") => {
                     percent_to_ratio(value).map(|v| (format!("{c}.currentLimitRatio"), v))
                 }
-                ("general", "State", _) => label_value(value, true)
+                ("general", "State" | "Charger state", _) => label_value(value, true)
                     .or_else(|| text_value(value))
                     .map(|v| (format!("{c}.chargingMode"), v)),
                 ("general", "Charger temp", "°C") => {
                     celsius_to_kelvin(value).map(|v| (format!("{c}.temperature"), v))
                 }
-
+                ("general", "Battery temp.", "°C")
+                | ("output", "Bat. temperature", "°C")
+                | ("monitoring", "Battery", "°C") => {
+                    celsius_to_kelvin(value).map(|v| (format!("{c}.battery.temperature"), v))
+                }
+                ("general", "AC present", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.acIn.state"), v))
+                }
                 ("output", "Battery name", _) => {
                     text_value(value).map(|v| (format!("{c}.battery.name"), v))
                 }
@@ -631,9 +638,20 @@ pub(super) fn map_field(
                 ("output", "Battery current", "A") => {
                     numeric(value).map(|v| (format!("{c}.current"), v))
                 }
-                ("output", "Bat. temperature", "°C") => {
-                    celsius_to_kelvin(value).map(|v| (format!("{c}.battery.temperature"), v))
+
+                ("dc-1-out", "Battery", "V") => {
+                    numeric(value).map(|v| (format!("{c}.output1.batteryVoltage"), v))
                 }
+                ("dc-1-out", "Batt/Shunt link", _) => {
+                    bool_or_label(value).map(|v| (format!("{c}.output1.batteryShuntState"), v))
+                }
+                ("dc-1-out", _, "") => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.output1.chargingMode"), v)),
+
+                ("dc-2-out", _, "") => label_value(value, true)
+                    .or_else(|| text_value(value))
+                    .map(|v| (format!("{c}.output2.chargingMode"), v)),
 
                 ("monitoring", "State", _) => {
                     bool_or_label(value).map(|v| (format!("{c}.deviceMode"), v))
@@ -644,29 +662,36 @@ pub(super) fn map_field(
                 ("monitoring", "Charger", _) => {
                     bool_or_label(value).map(|v| (format!("{c}.state"), v))
                 }
-                ("monitoring", "Set max current", "A") => {
+                ("monitoring", "Set max current", "A")
+                | ("general", "AC IN limit", "A") => {
                     numeric(value).map(|v| (format!("{c}.currentLimit"), v))
                 }
-                ("monitoring", "Output 1", "V") => {
+                ("monitoring", "Output 1", "V")
+                | ("dc-1-out", _, "V") => {
                     numeric(value).map(|v| (format!("{c}.voltage"), v))
                 }
-                ("monitoring", "Output 1", "A") => {
+
+                ("monitoring", "Output 1", "A")
+                | ("dc-1-out", _, "A") => {
                     numeric(value).map(|v| (format!("{c}.current"), v))
                 }
-                ("monitoring", "Output 2", "V") => {
+
+                ("monitoring", "Output 2", "V")
+                | ("dc-2-out", _, "V") => {
                     numeric(value).map(|v| (format!("{c}.output2.voltage"), v))
                 }
-                ("monitoring", "Output 2", "A") => {
+
+                ("monitoring", "Output 2", "A")
+                | ("dc-2-out", _, "A") => {
                     numeric(value).map(|v| (format!("{c}.output2.current"), v))
                 }
+
                 ("monitoring", "Output 3", "V") => {
                     numeric(value).map(|v| (format!("{c}.output3.voltage"), v))
                 }
+
                 ("monitoring", "Output 3", "A") => {
                     numeric(value).map(|v| (format!("{c}.output3.current"), v))
-                }
-                ("monitoring", "Battery", "°C") => {
-                    celsius_to_kelvin(value).map(|v| (format!("{c}.battery.temperature"), v))
                 }
 
                 _ => None,
