@@ -662,27 +662,22 @@ pub(super) fn map_field(
                 ("monitoring", "Charger", _) => {
                     bool_or_label(value).map(|v| (format!("{c}.state"), v))
                 }
-                ("monitoring", "Set max current", "A")
-                | ("general", "AC IN limit", "A") => {
+                ("monitoring", "Set max current", "A") | ("general", "AC IN limit", "A") => {
                     numeric(value).map(|v| (format!("{c}.currentLimit"), v))
                 }
-                ("monitoring", "Output 1", "V")
-                | ("dc-1-out", _, "V") => {
+                ("monitoring", "Output 1", "V") | ("dc-1-out", _, "V") => {
                     numeric(value).map(|v| (format!("{c}.voltage"), v))
                 }
 
-                ("monitoring", "Output 1", "A")
-                | ("dc-1-out", _, "A") => {
+                ("monitoring", "Output 1", "A") | ("dc-1-out", _, "A") => {
                     numeric(value).map(|v| (format!("{c}.current"), v))
                 }
 
-                ("monitoring", "Output 2", "V")
-                | ("dc-2-out", _, "V") => {
+                ("monitoring", "Output 2", "V") | ("dc-2-out", _, "V") => {
                     numeric(value).map(|v| (format!("{c}.output2.voltage"), v))
                 }
 
-                ("monitoring", "Output 2", "A")
-                | ("dc-2-out", _, "A") => {
+                ("monitoring", "Output 2", "A") | ("dc-2-out", _, "A") => {
                     numeric(value).map(|v| (format!("{c}.output2.current"), v))
                 }
 
