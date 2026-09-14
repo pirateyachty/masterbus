@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 
 use masterbus::{DeviceStatus, FieldId, Value, VisualizationType};
+use masterbus_tools::editor::{Hint, Origin, PathEditor, Stage};
 
 use crate::app::{App, EditKind, Focus, LOGIN_LEVELS, Row, TABS, TabKind, level_label, tab_label};
 
@@ -60,7 +61,6 @@ pub fn draw(f: &mut Frame, app: &App) {
 /// factor, so the only moment a human can check that °C is about to become
 /// kelvin is while they are choosing the path.
 fn draw_path_modal(f: &mut Frame, app: &App, area: Rect) {
-    use crate::app::{Hint, Origin, Stage};
     let Some(ed) = app.path_editor.as_ref() else {
         return;
     };
@@ -153,7 +153,7 @@ fn wrapped_rows(width: usize, cols: usize) -> u16 {
 /// leaf and this build could not classify every label, so the user says which
 /// labels mean `true`. Conventional labels arrive pre-filled; the rest are
 /// blank until chosen.
-fn draw_truth_modal(f: &mut Frame, ed: &crate::app::PathEditor, sel: usize, area: Rect) {
+fn draw_truth_modal(f: &mut Frame, ed: &PathEditor, sel: usize, area: Rect) {
     let w = area.width.saturating_sub(4).clamp(30, 84);
     let mut body = vec![
         Line::from(Span::styled(

@@ -16,6 +16,7 @@
 //!   id, for the models a name table cannot tell apart.
 
 pub mod database;
+pub mod editor;
 pub mod mapping;
 pub mod seed;
 pub mod signalk;

@@ -1,5 +1,6 @@
 //! TUI application state and the logic that mutates it.
 
+use masterbus_tools::editor::{CopyTarget, Origin, PathEditor, Stage, copy_to_targets};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use masterbus::{
     AccessLevel, DeviceIdentity, DeviceStatus, FieldId, FieldInfo, GroupInfo, MasterBus, Menu,
     Subscription, Value, VisualizationType, field_id,
 };
-use masterbus_tools::mapping::{DeviceMapping, FieldMapping, Mapping, field_key, parse_field_key};
+use masterbus_tools::mapping::{FieldMapping, Mapping, field_key};
 use masterbus_tools::{seed, signalk};
 
 /// Live-poll rate for the selected device's monitoring fields.
@@ -1048,134 +1049,6 @@ pub struct MappingSession {
     pub quit_armed: bool,
 }
 
-/// Where a pre-filled path suggestion came from, so the editor can say how much
-/// to trust it. "Known for this model" and "guessed from a name" deserve
-/// different amounts of scrutiny from whoever is about to press Enter.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    /// Already mapped; this is an edit.
-    Existing,
-    /// Proposed by the suggestion machinery, at the given confidence.
-    Suggested(seed::Tier),
-    /// Nothing to go on; the user is typing from scratch.
-    Blank,
-}
-
-/// Which part of a mapping the editor is asking for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Stage {
-    /// Typing the Signal K path.
-    Path,
-    /// Filling in the truth table for an enum on a boolean leaf; the cursor
-    /// is on the label at this index.
-    Truth(usize),
-}
-
-/// An in-progress edit of one field's Signal K path.
-pub struct PathEditor {
-    /// Which field is being mapped.
-    pub field: FieldId,
-    /// Its name, for the modal title.
-    pub field_name: String,
-    /// Its unit, to derive and display the conversion.
-    pub unit: String,
-    /// Its labels, if it is an enum; what a truth table is keyed on.
-    pub options: Vec<String>,
-    /// The path being typed.
-    pub buf: String,
-    /// Whether to publish the boolean negated.
-    pub invert: bool,
-    /// Label → boolean, for an enum published to a boolean leaf. Empty until
-    /// the path turns out to need one.
-    pub truth: BTreeMap<String, bool>,
-    /// Where `buf` was seeded from.
-    pub origin: Origin,
-    /// What the modal is currently asking for.
-    pub stage: Stage,
-}
-
-/// What the editor tells the user about the path as typed.
-pub enum Hint {
-    /// Publishable; describes the unit and conversion, or the truth table.
-    Ok(String),
-    /// Publishable, but worth a second look.
-    Warn(String),
-    /// Would be skipped by the sidecar; not saved.
-    Refuse(String),
-}
-
-impl PathEditor {
-    /// What saving the path as typed would do, worked out the way the sidecar
-    /// will (see [`signalk::plan`]), so the one moment a human can check that
-    /// `°C` becomes kelvin is while choosing the path.
-    pub fn plan(&self) -> Result<signalk::Plan, signalk::Refusal> {
-        signalk::plan(self.buf.trim(), &self.unit, &self.options, &self.entry())
-    }
-
-    /// The mapping entry as it stands.
-    pub fn entry(&self) -> FieldMapping {
-        FieldMapping {
-            path: self.buf.trim().to_string(),
-            invert: self.invert,
-            truth: self.truth.clone(),
-        }
-    }
-
-    /// The conversion (or truth table) the current path implies, as a line
-    /// for the modal.
-    pub fn hint(&self) -> Hint {
-        match self.plan() {
-            // A three-valued enum is a mode, not a boolean: Standby/On/Alarm
-            // squeezed into `enabled` loses Alarm. Say so before the truth
-            // table makes the loss look deliberate.
-            Err(signalk::Refusal::Truth { .. }) | Ok(_) if self.lossy_boolean() => {
-                Hint::Warn(format!(
-                    "{} labels → boolean loses info; use {} (string), or Enter for a truth table",
-                    self.options.len(),
-                    self.mode_leaf()
-                ))
-            }
-            Err(e) => Hint::Refuse(e.to_string()),
-            Ok(p) if !p.truth.is_empty() => Hint::Ok(format!(
-                "boolean: {}",
-                p.truth
-                    .iter()
-                    .map(|(k, v)| format!("{k}→{v}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            Ok(p) => match (p.unit, p.warning) {
-                (_, Some(w)) => Hint::Warn(w),
-                (None, None) => Hint::Ok("no unit: published as-is".into()),
-                (Some(u), None) => Hint::Ok(format!("→ {u} ({})", p.conv.describe())),
-            },
-        }
-    }
-
-    /// An enum with more than two labels going to a boolean leaf.
-    pub fn lossy_boolean(&self) -> bool {
-        self.options.len() > 2 && signalk::leaf_is_boolean(self.buf.trim())
-    }
-
-    /// The spec's string mode leaf for the path's category, to suggest instead
-    /// of a lossy boolean.
-    pub fn mode_leaf(&self) -> &'static str {
-        let p = self.buf.trim();
-        if p.starts_with("electrical.inverters.") {
-            "inverterMode"
-        } else if p.starts_with("electrical.chargers.") || p.starts_with("electrical.solar.") {
-            "chargingMode"
-        } else {
-            "a mode leaf"
-        }
-    }
-
-    /// Whether the truth table names every label.
-    pub fn truth_complete(&self) -> bool {
-        self.options.iter().all(|l| self.truth.contains_key(l))
-    }
-}
-
 impl App {
     /// Whether the mapping editor is active.
     pub fn mapping_mode(&self) -> bool {
@@ -1547,9 +1420,12 @@ impl App {
                     .flat_map(|g| g.fields.iter().map(|f| f.index))
                     .collect();
                 targets.push(CopyTarget {
+                    serial: ident.serial.clone(),
+                    article: ident.article.clone(),
+                    firmware: ident.firmware.clone(),
+                    name: ident.name.clone(),
                     instance: seed::instance_of(&ident.name, *id),
                     have,
-                    ident: ident.clone(),
                 });
             }
         }
@@ -1603,92 +1479,11 @@ impl App {
     }
 }
 
-/// A device the open device's mapping can be copied onto.
-pub struct CopyTarget {
-    /// Signal K instance proposed for it, used when it has no entry yet.
-    pub instance: String,
-    /// The monitoring field ids it actually has.
-    pub have: HashSet<FieldId>,
-    /// Its identity, recorded into the new entry.
-    pub ident: DeviceIdentity,
-}
-
-/// Copy one device's field mappings onto every target, substituting each
-/// target's own Signal K instance into the paths. Returns (copied, skipped).
-///
-/// Fields the target does not have are skipped rather than written blind. That
-/// is what keeps a cluster master's extra fields off a plain member of the same
-/// article, which is the case the bus in #6 actually contains.
-///
-/// The instance substituted is the one each *path* uses, not the one recorded
-/// for the device. A cluster master publishes its aggregate under one node
-/// and its own cells under another, so its entries do not share an instance;
-/// substituting the device's single recorded one copied nothing at all when
-/// pressed on the master (#12).
-fn copy_to_targets(
-    map: &mut Mapping,
-    src: &DeviceMapping,
-    targets: &[CopyTarget],
-) -> (usize, usize) {
-    let mut copied = 0usize;
-    let mut skipped = 0usize;
-    for t in targets {
-        let entry = map.devices.entry(t.ident.serial.clone()).or_default();
-        entry.article = t.ident.article.clone();
-        entry.firmware = t.ident.firmware.clone();
-        entry.name = t.ident.name.clone();
-        if entry.instance.is_empty() {
-            entry.instance = t.instance.clone();
-        }
-        let target_instance = entry.instance.clone();
-        for (key, fm) in &src.fields {
-            match parse_field_key(key) {
-                Some(id) if t.have.contains(&id) => {
-                    let from =
-                        signalk::instance_of(&fm.path).unwrap_or_else(|| src.instance.clone());
-                    let path = retarget(&fm.path, &from, &target_instance);
-                    // Nothing was substituted, so this target would publish to
-                    // the source's own node. Two devices writing one path is
-                    // never what "apply to this article" meant.
-                    if path == fm.path {
-                        skipped += 1;
-                        continue;
-                    }
-                    entry.fields.insert(
-                        key.to_string(),
-                        FieldMapping {
-                            path,
-                            invert: fm.invert,
-                            truth: fm.truth.clone(),
-                        },
-                    );
-                    copied += 1;
-                }
-                _ => skipped += 1,
-            }
-        }
-    }
-    (copied, skipped)
-}
-
-/// Swap one instance segment for another inside a Signal K path.
-///
-/// Only whole segments are replaced, so an instance that happens to be a
-/// substring of a leaf (`house` in `household`) is left alone. An empty source
-/// instance means there is nothing to substitute and the path is copied as-is.
-fn retarget(path: &str, from: &str, to: &str) -> String {
-    if from.is_empty() || from == to {
-        return path.to_string();
-    }
-    path.split('.')
-        .map(|seg| if seg == from { to } else { seg })
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+    use masterbus_tools::editor::{Hint, retarget};
+    use masterbus_tools::mapping::DeviceMapping;
 
     fn ident(serial: &str, name: &str) -> DeviceIdentity {
         DeviceIdentity {
@@ -1725,10 +1520,15 @@ mod mapping_tests {
     }
 
     fn target(serial: &str, name: &str, have: &[FieldId]) -> CopyTarget {
+        let ident = ident(serial, name);
+
         CopyTarget {
+            serial: ident.serial,
+            article: ident.article,
+            firmware: ident.firmware,
+            name: ident.name,
             instance: seed::instance_of(name, 0x1000),
             have: have.iter().copied().collect(),
-            ident: ident(serial, name),
         }
     }
 
@@ -1762,7 +1562,7 @@ mod mapping_tests {
     fn copying_records_the_target_identity_not_the_sources() {
         let mut map = Mapping::new();
         let mut t = target("MLI-2", "BAT 24V Service2", &[0x001]);
-        t.ident.firmware = "2.15".into();
+        t.firmware = "2.15".into();
         copy_to_targets(&mut map, &src_mapping(), &[t]);
         let d = &map.devices["MLI-2"];
         assert_eq!(d.name, "BAT 24V Service2");
