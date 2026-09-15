@@ -22,3 +22,5 @@ pub mod seed;
 pub mod signalk;
 pub mod units;
 pub mod web;
+
+pub mod signalk_schema;

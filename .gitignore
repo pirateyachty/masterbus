@@ -3,3 +3,5 @@
 .DS_Store
 Makefile.local
 /trident.json
+
+/mapping.json

@@ -7,16 +7,24 @@
 </head>
 
 <body>
+    <main>
+        <h1>MasterBus</h1>
 
-<h1>MasterBus</h1>
+        <nav class="tabs">
+            <button class="tab active" data-tab="all">ALL</button>
+            <button class="tab" data-tab="mapping">Mapping</button>
+            <button class="tab" data-tab="config">Config</button>
+        </nav>
 
-<div class="toolbar">
-    <button id="rescan">Rescan</button>
-    <span id="status">Loading devices…</span>
-</div>
+        <div class="toolbar">
+            <button id="rescan">Rescan</button>
+            <span id="status">Loading devices…</span>
+        </div>
 
-<div id="devices"></div>
+        <section id="devices"></section>
 
-<script src="/app.js"></script>
+    </main>
+
+    <script src="/app.js"></script>
 </body>
 </html>
